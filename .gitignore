@@ -1,0 +1,7 @@
+# .NET build output
+[Bb]in/
+[Oo]bj/
+*.user
+
+# Generated boardview output (keep sources, not artifacts)
+out_*.brd

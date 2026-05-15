@@ -1,0 +1,7 @@
+# one net name per line; order = net id (1-based). blanks/# ignored.
+GND
+VCC
+NET1
+NET2
+NET3
+CLK

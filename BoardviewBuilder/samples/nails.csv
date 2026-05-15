@@ -1,0 +1,3 @@
+probe,x,y,net,side
+1,260,300,NET1,1
+2,700,750,VCC,1
