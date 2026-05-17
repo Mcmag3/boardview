@@ -54,6 +54,11 @@ public sealed class MainForm : Form
     private Bitmap? _displayBitmap;          // processed image currently shown
     private readonly ImageAdjustments _adjustments = new();
 
+    // Last OCR pass — kept so we can re-draw bounding-box overlays whenever the
+    // image is reprocessed (slider changes, threshold toggle, etc.).
+    // Null until the user clicks "Extract from image" at least once.
+    private SchematicImageLoader.ExtractionResult? _lastOcr;
+
     // Pan/zoom state
     private bool _panning;
     private Point _panStartCursor;
@@ -508,6 +513,7 @@ public sealed class MainForm : Form
 
             _schematic = SchematicImageLoader.Load(path);
             _adjustments.Reset();
+            _lastOcr = null;   // new image → clear overlay
             RefreshProcessedImage(img, zoom);
             zoom.Value = 100;
             zoomLabel.Text = "100%";
@@ -536,11 +542,19 @@ public sealed class MainForm : Form
     }
 
     /// <summary>Recompute the processed display bitmap from the original image
-    /// and the current adjustments, and assign it to the PictureBox.</summary>
+    /// and the current adjustments, paint any OCR debug overlay on top, then
+    /// assign it to the PictureBox.</summary>
     private void RefreshProcessedImage(PictureBox img, TrackBar zoom)
     {
         if (_schematic is null) return;
         var newBmp = _adjustments.Apply(_schematic.Image);
+
+        // Paint OCR bounding boxes if we have results from the last extraction.
+        // Bboxes are in the processed-image coordinate system at extraction time;
+        // they stay valid as long as the user doesn't rotate after extracting.
+        if (_lastOcr != null)
+            DrawOcrOverlay(newBmp, _lastOcr);
+
         var oldImage = img.Image;
         img.Image = newBmp;
         oldImage?.Dispose();
@@ -548,6 +562,55 @@ public sealed class MainForm : Form
             _displayBitmap.Dispose();
         _displayBitmap = newBmp;
         ResizePictureBoxToZoom(img, zoom);
+    }
+
+    /// <summary>Draw classified OCR bounding boxes onto <paramref name="bmp"/>.
+    ///   * red    = reference designators (matched the designator regex)
+    ///   * green  = net labels             (matched the net-label regex)
+    ///   * yellow = other recognised words (didn't match either — useful for
+    ///              tuning thresholds and spotting OCR noise)
+    /// Each box is also labelled with its text in the matching colour.</summary>
+    private static void DrawOcrOverlay(Bitmap bmp, SchematicImageLoader.ExtractionResult ocr)
+    {
+        // Build a fast lookup of the classified words by their bbox + text so we
+        // can decide which colour each AllWords entry should be drawn with.
+        var designators = new HashSet<string>(ocr.Designators.Keys, StringComparer.Ordinal);
+        var netLabels   = new HashSet<string>(ocr.NetLabels.Keys,   StringComparer.Ordinal);
+
+        using var g = Graphics.FromImage(bmp);
+        g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
+
+        using var penRef     = new Pen(Color.Red,    2f);
+        using var penNet     = new Pen(Color.LimeGreen, 2f);
+        using var penOther   = new Pen(Color.FromArgb(180, 200, 160, 0), 1f); // dim yellow
+        using var brushRef   = new SolidBrush(Color.Red);
+        using var brushNet   = new SolidBrush(Color.LimeGreen);
+        using var brushOther = new SolidBrush(Color.FromArgb(200, 200, 160, 0));
+        using var labelFont  = new Font(FontFamily.GenericSansSerif, 9f, FontStyle.Bold);
+
+        foreach (var w in ocr.AllWords)
+        {
+            string cleaned = w.Text.Trim().Trim(':', ',', '.', ';');
+            string upper = cleaned.ToUpperInvariant();
+
+            Pen pen;
+            Brush brush;
+            if (designators.Contains(upper))     { pen = penRef;   brush = brushRef; }
+            else if (netLabels.Contains(upper))  { pen = penNet;   brush = brushNet; }
+            else                                  { pen = penOther; brush = brushOther; }
+
+            // Clamp to bitmap to avoid drawing off-canvas if a bbox is slightly past the edge.
+            var r = w.Bounds;
+            if (r.Width <= 0 || r.Height <= 0) continue;
+            g.DrawRectangle(pen, r);
+
+            // Print the recognised text just above the box (or below if it
+            // would clip the top of the image).
+            int textY = r.Y - 14;
+            if (textY < 0) textY = r.Bottom + 1;
+            g.DrawString(w.Text, labelFont, brush, r.X, textY);
+        }
     }
 
     private static void ResizePictureBoxToZoom(PictureBox img, TrackBar zoom)
@@ -724,15 +787,26 @@ public sealed class MainForm : Form
         Cursor.Current = Cursors.WaitCursor;
         try
         {
-            var stats = SchematicImageLoader.ExtractFromBitmap(_displayBitmap, _schematic.Netlist);
+            var result = SchematicImageLoader.ExtractFromBitmap(_displayBitmap, _schematic.Netlist);
+            _lastOcr = result;
+
+            // Re-render the image so the new overlay is drawn on top.
+            // Re-uses RefreshProcessedImage, which now consults _lastOcr.
+            // We need to look up the controls we created earlier — they were
+            // captured into fields by BuildSchematicTab.
+            RefreshProcessedImage(_imageBox, _zoomBar);
+
             netlistText.Text = NetlistTextFormat.Format(_schematic.Netlist)
                                                 .Replace("\n", Environment.NewLine);
+
+            var s = result.Stats;
             SchemOk(status,
-                $"OCR+Trace: {stats.WordsRecognised} word(s) → " +
-                $"{stats.ReferenceDesignatorsFound} designator(s), " +
-                $"{stats.NetLabelsFound} net label(s), " +
-                $"{stats.TracedNets} net(s), " +
-                $"{stats.Connections} pin↔net connection(s) in {stats.ElapsedMs} ms.");
+                $"OCR+Trace: {s.WordsRecognised} word(s) → " +
+                $"{s.ReferenceDesignatorsFound} designator(s), " +
+                $"{s.NetLabelsFound} net label(s), " +
+                $"{s.TracedNets} net(s), " +
+                $"{s.Connections} pin↔net connection(s) in {s.ElapsedMs} ms. " +
+                $"Boxes: red=designator, green=net label, yellow=other.");
         }
         catch (Exception ex)
         {

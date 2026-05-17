@@ -77,6 +77,17 @@ public static class SchematicImageLoader
         int Connections,
         long ElapsedMs);
 
+    /// <summary>Full extraction output, including the raw OCR words and the
+    /// classified subsets — the UI uses these to draw debug overlays on the
+    /// schematic image so the user can see exactly what Tesseract picked up.</summary>
+    public sealed class ExtractionResult
+    {
+        public required ExtractionStats Stats { get; init; }
+        public required IReadOnlyList<OcrEngine.Word> AllWords { get; init; }
+        public required IReadOnlyDictionary<string, OcrEngine.Word> Designators { get; init; }
+        public required IReadOnlyDictionary<string, OcrEngine.Word> NetLabels { get; init; }
+    }
+
     /// <summary>
     /// Run OCR over <paramref name="processed"/> (typically the user's
     /// adjusted/binarised image), classify the recognised words into
@@ -85,7 +96,7 @@ public static class SchematicImageLoader
     /// Components and Nets; the caller is expected to re-apply manual edits
     /// after extraction.
     /// </summary>
-    public static ExtractionStats ExtractFromBitmap(Bitmap processed, Netlist netlist)
+    public static ExtractionResult ExtractFromBitmap(Bitmap processed, Netlist netlist)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var words = OcrEngine.RecognizeWords(processed);
@@ -206,10 +217,18 @@ public static class SchematicImageLoader
                 string.Join(", ", lowConf.Select(w => $"\"{w.Text}\"@{w.Confidence:F2}")));
         }
 
-        return new ExtractionStats(
+        var stats = new ExtractionStats(
             words.Count, refs.Count, nets.Count,
             membersByName.Count, connections,
             sw.ElapsedMilliseconds);
+
+        return new ExtractionResult
+        {
+            Stats = stats,
+            AllWords = words,
+            Designators = refs,
+            NetLabels = nets,
+        };
     }
 
     /// <summary>Sort rank for a net name — lower comes first. Returns 0 for
