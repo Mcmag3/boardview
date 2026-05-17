@@ -111,8 +111,10 @@ public static class SymbolDetector
         IReadOnlyList<DrawingRectangle> allTextBoxes,
         int binaryThreshold = 160)
     {
-        int marginX = Math.Max(60, textBbox.Width  * 4);
-        int marginY = Math.Max(60, textBbox.Height * 4);
+        // Bigger search region — caps in dense schematics often sit a fair
+        // distance from their designator. 6× the text size catches most.
+        int marginX = Math.Max(80, textBbox.Width  * 6);
+        int marginY = Math.Max(80, textBbox.Height * 6);
 
         int sx = Math.Max(0, textBbox.X      - marginX);
         int sy = Math.Max(0, textBbox.Y      - marginY);
@@ -143,13 +145,51 @@ public static class SymbolDetector
             Cv2.Rectangle(bin, local, Scalar.Black, thickness: -1);
         }
 
-        // ---- Attempt 1: paired rectangular plates (filled and/or outlined) ---
-        var rectPair = FindCapacitorRectangles(bin, textBbox, sx, sy);
+        // Make a SECOND binary with long line segments (the wire stubs)
+        // erased. In a schematic the two cap plates are connected to wires,
+        // and after a simple threshold they fuse with those wires into ONE
+        // big contour — the rectangle filters never match. Erasing the wires
+        // first leaves the plates as standalone contours we can find.
+        using var binNoWires = bin.Clone();
+        EraseLongLines(binNoWires, textBbox);
+
+        // ---- Attempt 1: paired rectangular plates on the WIRE-FREE image ----
+        var rectPair = FindCapacitorRectangles(binNoWires, textBbox, sx, sy);
         if (rectPair != null) return rectPair;
 
-        // ---- Attempt 2: paired thin line plates (legacy thin-stroke style) ---
-        return FindCapacitorPlates(bin, textBbox, sx, sy);
+        // ---- Attempt 2: paired rectangular plates on the RAW masked image ---
+        //   (some plates are drawn detached from wires, so the wire-erase
+        //   step is unnecessary — try the unmodified binary too.)
+        rectPair = FindCapacitorRectangles(bin, textBbox, sx, sy);
+        if (rectPair != null) return rectPair;
+
+        // ---- Attempt 3: paired thin line plates (legacy thin-stroke style) --
+        return FindCapacitorPlates(binNoWires, textBbox, sx, sy);
     }
+
+    /// <summary>Paint black over every long straight line segment in
+    /// <paramref name="bin"/>. We find segments with HoughLinesP using a
+    /// minimum length of ~5× text height (long enough to be a wire, much
+    /// longer than any cap plate) and draw them in black with a 3 px stroke
+    /// so anti-aliased pixels at the wire edges are also wiped. The plates
+    /// — short by definition — survive intact.</summary>
+    private static void EraseLongLines(Mat bin, DrawingRectangle textBbox)
+    {
+        float textH = Math.Max(8, textBbox.Height);
+        int minLineLen = Math.Max(20, (int)(textH * 4.0f));
+        int maxLineGap = Math.Max(3, (int)(textH * 0.5f));
+
+        var lines = Cv2.HoughLinesP(bin, rho: 1, theta: Math.PI / 180,
+                                     threshold: 30, minLineLength: minLineLen,
+                                     maxLineGap: maxLineGap);
+        if (lines == null) return;
+
+        foreach (var l in lines)
+        {
+            Cv2.Line(bin, l.P1, l.P2, Scalar.Black, thickness: 3);
+        }
+    }
+
 
     /// <summary>Look for TWO parallel rectangular plates in the masked crop.
     /// Each plate can be filled (solid block) or unfilled (outlined). The
