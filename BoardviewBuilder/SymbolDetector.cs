@@ -14,7 +14,12 @@ namespace BoardviewBuilder;
 ///
 /// Current coverage:
 ///   * R / RN  → resistor: rectangle (IEC) OR zig-zag (US).
-///   * (others will be added incrementally — capacitor, diode, BJT, IC.)
+///   * C       → capacitor: a pair of short PARALLEL line segments separated
+///               by a small gap (the two plates). Works for both non-polarised
+///               (two straight lines) and polarised (straight + curved — the
+///               curved plate registers as a short segment too, since we don't
+///               demand both are perfectly straight).
+///   * (others will be added incrementally — diode, BJT, IC.)
 ///
 /// Implementation notes:
 ///   * We use OpenCvSharp4 because it gives us contour finding, polygon
@@ -91,6 +96,177 @@ public static class SymbolDetector
         if (zigHit != null) return zigHit;
 
         return null;
+    }
+
+    /// <summary>Try to find a capacitor near <paramref name="textBbox"/>. A
+    /// capacitor is two short PARALLEL line segments (the two plates) separated
+    /// by a small perpendicular gap — looks like `||` (vertical orientation)
+    /// or `=` (horizontal orientation) on the page. We crop, mask out all
+    /// OCR text, run HoughLinesP, then search for the best pair of segments
+    /// that satisfy the geometric constraints.</summary>
+    public static SymbolHit? FindCapacitorNear(
+        Bitmap processed,
+        DrawingRectangle textBbox,
+        IReadOnlyList<DrawingRectangle> allTextBoxes,
+        int binaryThreshold = 160)
+    {
+        int marginX = Math.Max(60, textBbox.Width  * 4);
+        int marginY = Math.Max(60, textBbox.Height * 4);
+
+        int sx = Math.Max(0, textBbox.X      - marginX);
+        int sy = Math.Max(0, textBbox.Y      - marginY);
+        int sw = Math.Min(processed.Width,  textBbox.Right  + marginX) - sx;
+        int sh = Math.Min(processed.Height, textBbox.Bottom + marginY) - sy;
+        if (sw <= 0 || sh <= 0) return null;
+
+        var cropRect = new CvRect(sx, sy, sw, sh);
+
+        using var full = OpenCvSharp.Extensions.BitmapConverter.ToMat(processed);
+        using var crop = full.SubMat(cropRect).Clone();
+
+        using var gray = new Mat();
+        if (crop.Channels() == 1) crop.CopyTo(gray);
+        else Cv2.CvtColor(crop, gray, ColorConversionCodes.BGR2GRAY);
+
+        using var bin = new Mat();
+        Cv2.Threshold(gray, bin, binaryThreshold, 255, ThresholdTypes.BinaryInv);
+
+        var fullCrop = new CvRect(0, 0, sw, sh);
+        foreach (var tb in allTextBoxes)
+        {
+            int tx = tb.X - sx;
+            int ty = tb.Y - sy;
+            var local = new CvRect(tx - 2, ty - 2, tb.Width + 4, tb.Height + 4)
+                            .Intersect(fullCrop);
+            if (local.Width <= 0 || local.Height <= 0) continue;
+            Cv2.Rectangle(bin, local, Scalar.Black, thickness: -1);
+        }
+
+        return FindCapacitorPlates(bin, textBbox, sx, sy);
+    }
+
+    /// <summary>Look for two short parallel line segments separated by a small
+    /// gap — the two plates of a capacitor. Parameters are sized relative to
+    /// the OCR text height because that's our only on-page scale reference.
+    /// </summary>
+    private static SymbolHit? FindCapacitorPlates(Mat bin, DrawingRectangle textBbox, int cropOriginX, int cropOriginY)
+    {
+        float textH = Math.Max(8, textBbox.Height);
+
+        // Plate length: roughly 0.8 - 3.5 × text height.
+        float minPlateLen = textH * 0.8f;
+        float maxPlateLen = textH * 3.5f;
+        // Gap between the two plates (perpendicular distance):
+        // typically a small fraction of the plate length, but not zero.
+        float minGap = Math.Max(2f, textH * 0.15f);
+        float maxGap = textH * 1.5f;
+        // Angle tolerance between the two plates (degrees).
+        float angleTol = 15f;
+        // Length similarity: plates should be within 60% of each other.
+        float lenSimilarity = 0.6f;
+        // Lateral offset (along the plate direction) of the two midpoints,
+        // expressed as a fraction of the average plate length: 0 = perfectly
+        // aligned, 1 = end-to-end. We allow up to 0.6.
+        float maxLateralFrac = 0.6f;
+
+        int minLineLen = Math.Max(4, (int)(minPlateLen * 0.6f));
+        int maxLineGap = Math.Max(2, (int)(textH * 0.25f));
+
+        var segments = Cv2.HoughLinesP(bin, rho: 1, theta: Math.PI / 180,
+                                       threshold: 15, minLineLength: minLineLen,
+                                       maxLineGap: maxLineGap);
+        if (segments == null || segments.Length < 2) return null;
+
+        // Convert to a friendly struct and prefilter by length.
+        var segs = new List<(float cx, float cy, float angle, float len, float dx, float dy)>();
+        foreach (var s in segments)
+        {
+            float dx = s.P2.X - s.P1.X;
+            float dy = s.P2.Y - s.P1.Y;
+            float len = MathF.Sqrt(dx * dx + dy * dy);
+            if (len < minPlateLen || len > maxPlateLen) continue;
+            float a = MathF.Atan2(dy, dx) * (180f / MathF.PI);
+            if (a > 90) a -= 180;
+            else if (a < -90) a += 180;
+            float cx = (s.P1.X + s.P2.X) * 0.5f;
+            float cy = (s.P1.Y + s.P2.Y) * 0.5f;
+            // Unit-vector components for projection math (along the line).
+            float ux = dx / Math.Max(1e-6f, len);
+            float uy = dy / Math.Max(1e-6f, len);
+            segs.Add((cx, cy, a, len, ux, uy));
+        }
+        if (segs.Count < 2) return null;
+
+        SymbolHit? best = null;
+        float bestScore = 0f;
+
+        for (int i = 0; i < segs.Count; i++)
+        for (int j = i + 1; j < segs.Count; j++)
+        {
+            var a = segs[i];
+            var b = segs[j];
+
+            // Same orientation (within angleTol)?
+            float angDiff = Math.Abs(a.angle - b.angle);
+            if (angDiff > 90) angDiff = 180 - angDiff;
+            if (angDiff > angleTol) continue;
+
+            // Similar length?
+            float lenRatio = Math.Min(a.len, b.len) / Math.Max(a.len, b.len);
+            if (lenRatio < lenSimilarity) continue;
+
+            // Perpendicular gap between the two plates: project the midpoint
+            // delta onto the perpendicular of plate A's direction.
+            float dxm = b.cx - a.cx;
+            float dym = b.cy - a.cy;
+            // Perpendicular to (a.dx, a.dy) is (-a.dy, a.dx) — but we stored
+            // unit components, so this is (-a.dy_unit, a.dx_unit) = (-a.uy, a.ux)
+            // wait we stored dx as unit-vector component (ux, uy). Rename mental:
+            // a.dx = ux, a.dy = uy in our tuple. Perpendicular unit = (-uy, ux).
+            float perp = MathF.Abs(-a.dy * dxm + a.dx * dym);
+            if (perp < minGap || perp > maxGap) continue;
+
+            // Lateral offset along the plate direction.
+            float lateral = MathF.Abs(a.dx * dxm + a.dy * dym);
+            float avgLen = (a.len + b.len) * 0.5f;
+            if (lateral > maxLateralFrac * avgLen) continue;
+
+            // Score: prefer (i) plates of similar length, (ii) small gap
+            // relative to plate length, (iii) small lateral offset.
+            float lenScore = lenRatio;
+            float gapScore = 1f - Math.Min(1f, perp / (avgLen * 0.8f));
+            float latScore = 1f - Math.Min(1f, lateral / (avgLen * maxLateralFrac));
+            float score = 0.4f * lenScore + 0.35f * gapScore + 0.25f * latScore;
+
+            if (score > bestScore)
+            {
+                // Bounding box = union of both segments.
+                float halfA = a.len * 0.5f;
+                float halfB = b.len * 0.5f;
+                float ax1 = a.cx - a.dx * halfA, ay1 = a.cy - a.dy * halfA;
+                float ax2 = a.cx + a.dx * halfA, ay2 = a.cy + a.dy * halfA;
+                float bx1 = b.cx - b.dx * halfB, by1 = b.cy - b.dy * halfB;
+                float bx2 = b.cx + b.dx * halfB, by2 = b.cy + b.dy * halfB;
+                float minX = MathF.Min(MathF.Min(ax1, ax2), MathF.Min(bx1, bx2));
+                float minY = MathF.Min(MathF.Min(ay1, ay2), MathF.Min(by1, by2));
+                float maxX = MathF.Max(MathF.Max(ax1, ax2), MathF.Max(bx1, bx2));
+                float maxY = MathF.Max(MathF.Max(ay1, ay2), MathF.Max(by1, by2));
+                int bx = Math.Max(0, (int)MathF.Floor(minX));
+                int by = Math.Max(0, (int)MathF.Floor(minY));
+                int bw = Math.Max(1, (int)MathF.Ceiling(maxX - minX));
+                int bh = Math.Max(1, (int)MathF.Ceiling(maxY - minY));
+
+                bestScore = score;
+                best = new SymbolHit
+                {
+                    Bounds = new DrawingRectangle(bx + cropOriginX, by + cropOriginY, bw, bh),
+                    Kind = "capacitor",
+                    Score = score,
+                };
+            }
+        }
+
+        return bestScore >= 0.45f ? best : null;
     }
 
     /// <summary>Look for a small rectangular contour inside the masked crop.

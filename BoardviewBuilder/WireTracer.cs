@@ -122,6 +122,12 @@ public static class WireTracer
                         processed, texts[i].Bounds, allTextBoxes, binaryThreshold);
                     if (hit != null) shapeBbox = hit.Bounds;
                 }
+                else if (letter == 'C')
+                {
+                    var hit = SymbolDetector.FindCapacitorNear(
+                        processed, texts[i].Bounds, allTextBoxes, binaryThreshold);
+                    if (hit != null) shapeBbox = hit.Bounds;
+                }
 
                 if (shapeBbox.HasValue)
                 {
