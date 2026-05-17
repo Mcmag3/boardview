@@ -569,11 +569,13 @@ public sealed class MainForm : Form
     ///   * green  = net labels             (matched the net-label regex)
     ///   * yellow = other recognised words (didn't match either — useful for
     ///              tuning thresholds and spotting OCR noise)
-    /// Each box is also labelled with its text in the matching colour.</summary>
+    ///   * blue   = detected component SYMBOL for a designator (the largest
+    ///              non-text connected component the tracer found near the
+    ///              designator text — i.e. where the wires actually attach).
+    /// Each text box is labelled with its recognised text; each symbol box
+    /// is labelled with the designator it belongs to.</summary>
     private static void DrawOcrOverlay(Bitmap bmp, SchematicImageLoader.ExtractionResult ocr)
     {
-        // Build a fast lookup of the classified words by their bbox + text so we
-        // can decide which colour each AllWords entry should be drawn with.
         var designators = new HashSet<string>(ocr.Designators.Keys, StringComparer.Ordinal);
         var netLabels   = new HashSet<string>(ocr.NetLabels.Keys,   StringComparer.Ordinal);
 
@@ -584,11 +586,25 @@ public sealed class MainForm : Form
         using var penRef     = new Pen(Color.Red,    2f);
         using var penNet     = new Pen(Color.LimeGreen, 2f);
         using var penOther   = new Pen(Color.FromArgb(180, 200, 160, 0), 1f); // dim yellow
+        using var penSymbol  = new Pen(Color.DodgerBlue, 3f);                  // bold blue
         using var brushRef   = new SolidBrush(Color.Red);
         using var brushNet   = new SolidBrush(Color.LimeGreen);
         using var brushOther = new SolidBrush(Color.FromArgb(200, 200, 160, 0));
+        using var brushSym   = new SolidBrush(Color.DodgerBlue);
         using var labelFont  = new Font(FontFamily.GenericSansSerif, 9f, FontStyle.Bold);
+        using var symFont    = new Font(FontFamily.GenericSansSerif, 10f, FontStyle.Bold);
 
+        // ---- Pass 1: symbol bboxes (blue, drawn FIRST so text boxes overlay on top) ----
+        foreach (var kv in ocr.SymbolBoxes)
+        {
+            var r = kv.Value;
+            if (r.Width <= 0 || r.Height <= 0) continue;
+            g.DrawRectangle(penSymbol, r);
+            // Label the symbol bbox with the designator name in the top-left corner.
+            g.DrawString(kv.Key, symFont, brushSym, r.X + 2, r.Y + 2);
+        }
+
+        // ---- Pass 2: text bboxes (red/green/yellow) ----
         foreach (var w in ocr.AllWords)
         {
             string cleaned = w.Text.Trim().Trim(':', ',', '.', ';');
@@ -600,13 +616,10 @@ public sealed class MainForm : Form
             else if (netLabels.Contains(upper))  { pen = penNet;   brush = brushNet; }
             else                                  { pen = penOther; brush = brushOther; }
 
-            // Clamp to bitmap to avoid drawing off-canvas if a bbox is slightly past the edge.
             var r = w.Bounds;
             if (r.Width <= 0 || r.Height <= 0) continue;
             g.DrawRectangle(pen, r);
 
-            // Print the recognised text just above the box (or below if it
-            // would clip the top of the image).
             int textY = r.Y - 14;
             if (textY < 0) textY = r.Bottom + 1;
             g.DrawString(w.Text, labelFont, brush, r.X, textY);
@@ -804,9 +817,10 @@ public sealed class MainForm : Form
                 $"OCR+Trace: {s.WordsRecognised} word(s) → " +
                 $"{s.ReferenceDesignatorsFound} designator(s), " +
                 $"{s.NetLabelsFound} net label(s), " +
+                $"{result.SymbolBoxes.Count} symbol(s), " +
                 $"{s.TracedNets} net(s), " +
                 $"{s.Connections} pin↔net connection(s) in {s.ElapsedMs} ms. " +
-                $"Boxes: red=designator, green=net label, yellow=other.");
+                $"Boxes: red=designator, green=net label, blue=symbol, yellow=other.");
         }
         catch (Exception ex)
         {

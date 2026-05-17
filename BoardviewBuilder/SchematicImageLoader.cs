@@ -86,6 +86,10 @@ public static class SchematicImageLoader
         public required IReadOnlyList<OcrEngine.Word> AllWords { get; init; }
         public required IReadOnlyDictionary<string, OcrEngine.Word> Designators { get; init; }
         public required IReadOnlyDictionary<string, OcrEngine.Word> NetLabels { get; init; }
+        /// <summary>Designator text → detected symbol bbox (the largest non-letter
+        /// CC near the text). Missing key = no symbol found. Used by the UI to
+        /// draw a blue rectangle around each detected component symbol.</summary>
+        public required IReadOnlyDictionary<string, Rectangle> SymbolBoxes { get; init; }
     }
 
     /// <summary>
@@ -132,7 +136,9 @@ public static class SchematicImageLoader
                 kv.Key, kv.Value.Bounds, WireTracer.TextKind.NetLabel));
 
         // ---- Trace wires ----
-        var (tracedGroups, traceStats) = WireTracer.Trace(processed, textBoxes);
+        var traceResult = WireTracer.Trace(processed, textBoxes);
+        var tracedGroups = traceResult.Nets;
+        var traceStats = traceResult.Stats;
 
         // Merge groups by name — a schematic typically has many "GND" labels
         // that are all logically the same net, even if the tracer's CC pass
@@ -206,6 +212,7 @@ public static class SchematicImageLoader
         netlist.Notes.Add($"OCR: recognised {words.Count} word(s).");
         netlist.Notes.Add($"OCR: {refs.Count} reference designator(s), {nets.Count} net label(s).");
         netlist.Notes.Add($"Trace: {traceStats.ConnectedComponents} CC(s), " +
+                          $"{traceStats.SymbolsFound} symbol(s) located, " +
                           $"{traceStats.Nets} traced group(s) → {membersByName.Count} named net(s), " +
                           $"{traceStats.IsolatedTextBoxes} isolated text box(es), " +
                           $"{connections} pin↔net connection(s), " +
@@ -228,6 +235,7 @@ public static class SchematicImageLoader
             AllWords = words,
             Designators = refs,
             NetLabels = nets,
+            SymbolBoxes = traceResult.SymbolBoxes,
         };
     }
 
