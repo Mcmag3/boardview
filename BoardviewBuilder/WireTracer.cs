@@ -91,6 +91,9 @@ public static class WireTracer
             foreach (var lbl in CollectCCsInside(labels, w, h, texts[i].Bounds))
                 forbidden.Add(lbl);
 
+        // Collect ALL text bboxes once for the SymbolDetector mask step.
+        var allTextBoxes = texts.Select(t => t.Bounds).ToList();
+
         // 4+5) Per-text CC assignment.
         var textCC = new int[texts.Count];
         var symbolBoxes = new Dictionary<string, Rectangle>(StringComparer.Ordinal);
@@ -105,13 +108,41 @@ public static class WireTracer
             }
             else
             {
-                // Designator: largest non-forbidden CC in an expanded search box.
-                int symCC = FindSymbolCC(labels, w, h, texts[i].Bounds, forbidden);
-                textCC[i] = symCC;
-                if (symCC != 0)
+                // Designator: pick by the FIRST LETTER of the designator —
+                //   "R" → shape-aware resistor detector (OpenCvSharp).
+                //   anything else → fallback to "largest non-letter CC nearby"
+                //   (Option A behaviour) until we add a dedicated shape detector.
+                string desig = texts[i].Text;
+                char letter = desig.Length > 0 ? desig[0] : '?';
+
+                Rectangle? shapeBbox = null;
+                if (letter == 'R')
                 {
-                    symbolBoxes[texts[i].Text] = ccBoxes[symCC];
+                    var hit = SymbolDetector.FindResistorNear(
+                        processed, texts[i].Bounds, allTextBoxes, binaryThreshold);
+                    if (hit != null) shapeBbox = hit.Bounds;
+                }
+
+                if (shapeBbox.HasValue)
+                {
+                    // Shape detector found a real symbol. Look up which CC
+                    // lives inside that bbox so connectivity tracing still
+                    // works — picks the largest non-letter CC that overlaps.
+                    int symCC = FindDominantCCInside(labels, w, h, shapeBbox.Value, forbidden);
+                    textCC[i] = symCC;
+                    symbolBoxes[desig] = shapeBbox.Value;
                     symbolsFound++;
+                }
+                else
+                {
+                    // Fallback: largest non-forbidden CC in an expanded search box.
+                    int symCC = FindSymbolCC(labels, w, h, texts[i].Bounds, forbidden);
+                    textCC[i] = symCC;
+                    if (symCC != 0)
+                    {
+                        symbolBoxes[desig] = ccBoxes[symCC];
+                        symbolsFound++;
+                    }
                 }
             }
         }
@@ -347,6 +378,37 @@ public static class WireTracer
         }
         if (counts.Count == 0) return 0;
 
+        int best = 0, bestCount = 0;
+        foreach (var kv in counts)
+            if (kv.Value > bestCount) { best = kv.Key; bestCount = kv.Value; }
+        return best;
+    }
+
+    /// <summary>Largest non-forbidden CC whose pixels fall INSIDE bbox.
+    /// Used after the shape detector returns a symbol bbox — we still need
+    /// a CC label for the grouping step.</summary>
+    private static int FindDominantCCInside(int[] labels, int w, int h,
+                                            Rectangle bbox, HashSet<int> forbidden)
+    {
+        int x0 = Math.Max(0, bbox.X);
+        int y0 = Math.Max(0, bbox.Y);
+        int x1 = Math.Min(w, bbox.Right);
+        int y1 = Math.Min(h, bbox.Bottom);
+
+        var counts = new Dictionary<int, int>();
+        for (int y = y0; y < y1; y++)
+        {
+            int rs = y * w;
+            for (int x = x0; x < x1; x++)
+            {
+                int lbl = labels[rs + x];
+                if (lbl == 0) continue;
+                if (forbidden.Contains(lbl)) continue;
+                counts.TryGetValue(lbl, out int c);
+                counts[lbl] = c + 1;
+            }
+        }
+        if (counts.Count == 0) return 0;
         int best = 0, bestCount = 0;
         foreach (var kv in counts)
             if (kv.Value > bestCount) { best = kv.Key; bestCount = kv.Value; }
