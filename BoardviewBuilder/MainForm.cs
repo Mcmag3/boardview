@@ -708,12 +708,37 @@ public sealed class MainForm : Form
 
     private void ReExtract(TextBox netlistText, Label status)
     {
-        if (_schematic is null) return;
-        // Currently stub — the extractor doesn't yet read the processed image.
-        // For now we just regenerate the preview from whatever the load step produced.
-        netlistText.Text = NetlistTextFormat.Format(_schematic.Netlist)
-                                            .Replace("\n", Environment.NewLine);
-        SchemOk(status, "Reset netlist text from last extractor run (extractor is still a stub).");
+        if (_schematic is null)
+        {
+            SchemWarn(status, "Load a schematic image first.");
+            return;
+        }
+        if (_displayBitmap is null)
+        {
+            SchemWarn(status, "Processed image not ready — try reloading.");
+            return;
+        }
+
+        // Run OCR on the CURRENT processed bitmap so the user's threshold /
+        // grayscale / contrast tweaks actually affect the result.
+        Cursor.Current = Cursors.WaitCursor;
+        try
+        {
+            var stats = SchematicImageLoader.ExtractFromBitmap(_displayBitmap, _schematic.Netlist);
+            netlistText.Text = NetlistTextFormat.Format(_schematic.Netlist)
+                                                .Replace("\n", Environment.NewLine);
+            SchemOk(status,
+                $"OCR: {stats.WordsRecognised} word(s) → {stats.ReferenceDesignatorsFound} " +
+                $"reference designator(s) in {stats.ElapsedMs} ms.");
+        }
+        catch (Exception ex)
+        {
+            SchemWarn(status, "OCR failed: " + ex.Message);
+        }
+        finally
+        {
+            Cursor.Current = Cursors.Default;
+        }
     }
 
     private static void SchemOk(Label status, string msg)   { status.ForeColor = Color.DarkGreen; status.Text = msg; }

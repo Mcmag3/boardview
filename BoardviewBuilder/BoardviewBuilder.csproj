@@ -7,6 +7,20 @@
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- Tesseract ships native x64 DLLs in runtimes/. Pinning to win-x64
+         makes MSBuild copy them next to the executable on plain `dotnet build`. -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
   </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Tesseract" Version="5.2.0" />
+  </ItemGroup>
+
+  <!-- Copy the OCR traineddata folder to the build output so Tesseract can
+       find it at runtime (we look for ./tessdata/eng.traineddata next to the .exe). -->
+  <ItemGroup>
+    <None Include="tessdata\**\*.*" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
 
 </Project>

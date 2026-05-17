@@ -5,17 +5,14 @@ namespace BoardviewBuilder;
 /// <summary>
 /// Loads a raster schematic (JPEG / PNG / BMP) and produces a <see cref="Netlist"/>.
 ///
-/// STATUS (step 1 of the image → netlist pipeline):
-///   * Loads the image from disk into a <see cref="Bitmap"/>.
-///   * Captures basic metadata (dimensions, pixel format, DPI, file size).
-///   * Returns an empty <see cref="Netlist"/> with diagnostic notes attached.
+/// STATUS:
+///   * <see cref="Load"/>           — loads the image, captures metadata, returns an empty Netlist.
+///   * <see cref="ExtractFromBitmap"/> — runs OCR (Tesseract) on a processed bitmap
+///                                     and populates the Netlist with reference designators.
 ///
-/// Future steps will plug into <see cref="Extract"/> to populate the netlist
-/// (OCR for reference designators &amp; net labels, line/wire tracing for
-/// connectivity, symbol recognition for pin counts).
-///
-/// The loader is kept as a pure helper class — the same shape as
-/// <see cref="CsvLoader"/> — so the UI doesn't depend on its internals.
+/// The two operations are split so the UI can run extraction repeatedly on the
+/// CURRENT processed (threshold/grayscale/etc.) bitmap without reloading the file.
+/// Future stages will extend ExtractFromBitmap with net-label OCR and wire tracing.
 /// </summary>
 public static class SchematicImageLoader
 {
@@ -33,8 +30,9 @@ public static class SchematicImageLoader
     }
 
     /// <summary>
-    /// Load the image file and run the (currently stub) extraction.
-    /// Throws on missing file or unreadable image.
+    /// Load the image file. Returns the bitmap plus an EMPTY netlist (only
+    /// metadata notes). Call <see cref="ExtractFromBitmap"/> on the processed
+    /// image to actually populate the netlist.
     /// </summary>
     public static LoadResult Load(string path)
     {
@@ -42,8 +40,7 @@ public static class SchematicImageLoader
             throw new FileNotFoundException($"Schematic image not found: {path}");
 
         // Bitmap(string) keeps a file lock for the lifetime of the bitmap.
-        // Load via a memory copy so the source file stays free (lets the user
-        // move/rename it while the app is open).
+        // Load via a memory copy so the source file stays free.
         Bitmap bmp;
         byte[] bytes = File.ReadAllBytes(path);
         using (var ms = new MemoryStream(bytes, writable: false))
@@ -61,8 +58,7 @@ public static class SchematicImageLoader
         netlist.Notes.Add($"Image: {bmp.Width} × {bmp.Height} px, " +
                           $"{bmp.HorizontalResolution:F0}×{bmp.VerticalResolution:F0} DPI, " +
                           $"{PixelFormatName(bmp.PixelFormat)}");
-
-        Extract(bmp, netlist);
+        netlist.Notes.Add("Click \"Extract from image\" to run OCR.");
 
         return new LoadResult
         {
@@ -72,63 +68,81 @@ public static class SchematicImageLoader
         };
     }
 
+    /// <summary>Result of one extraction pass — useful for the status bar.</summary>
+    public readonly record struct ExtractionStats(
+        int WordsRecognised,
+        int ReferenceDesignatorsFound,
+        long ElapsedMs);
+
     /// <summary>
-    /// Schematic-to-netlist extraction. CURRENTLY A STUB — populates only
-    /// diagnostic notes. Future implementations will:
-    ///   1. Pre-process the image (grayscale, threshold, deskew).
-    ///   2. Run OCR to find reference designators (R1, U3, …) and net labels.
-    ///   3. Trace orthogonal wire segments between symbol pins.
-    ///   4. Resolve junctions/dots into nets.
-    ///   5. Emit <see cref="NetlistComponent"/>s and <see cref="NetlistNet"/>s.
+    /// Run OCR over <paramref name="processed"/> (typically the user's
+    /// adjusted/binarised image), filter the words for reference designators,
+    /// and replace the components in <paramref name="netlist"/>.
+    ///
+    /// Nets are NOT touched — net-label extraction comes in a later step.
+    /// Existing components/pins in <paramref name="netlist"/> are REPLACED;
+    /// the caller is expected to re-apply manual edits after extraction.
     /// </summary>
-    private static void Extract(Bitmap image, Netlist netlist)
+    public static ExtractionStats ExtractFromBitmap(Bitmap processed, Netlist netlist)
     {
-        netlist.Notes.Add("Extractor: stub (no OCR / line tracing yet).");
-        netlist.Notes.Add("Next step: add OCR pass for reference designators.");
-        // Intentionally empty — components/nets populated by later iterations.
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var words = OcrEngine.RecognizeWords(processed);
+        sw.Stop();
+
+        // Deduplicate by uppercased text — Tesseract can return the same
+        // designator multiple times if a label is split across two boxes.
+        // We keep the FIRST occurrence's bounding box.
+        var refs = new Dictionary<string, OcrEngine.Word>(StringComparer.Ordinal);
+        foreach (var w in words)
+        {
+            // Strip common OCR clutter — colons, commas, trailing punctuation.
+            string cleaned = w.Text.Trim().Trim(':', ',', '.', ';');
+            // Up-case so "r1" and "R1" merge.
+            string upper = cleaned.ToUpperInvariant();
+            if (OcrEngine.ReferenceDesignatorRegex.IsMatch(upper) && !refs.ContainsKey(upper))
+                refs[upper] = w with { Text = upper };
+        }
+
+        // Order designators by prefix letters, then numeric suffix, so the
+        // netlist looks tidy (C1, C2, C3, R1, R2, U1, …).
+        var ordered = refs.Values
+            .OrderBy(w => SplitPrefix(w.Text).prefix, StringComparer.Ordinal)
+            .ThenBy(w => SplitPrefix(w.Text).number)
+            .ToList();
+
+        netlist.Components.Clear();
+        foreach (var w in ordered)
+            netlist.Components.Add(new NetlistComponent { Reference = w.Text });
+
+        // Refresh diagnostic notes so the user can see what happened.
+        // Keep the original "File:" / "Image:" notes; drop the prior extractor notes.
+        netlist.Notes.RemoveAll(n => n.StartsWith("OCR:", StringComparison.Ordinal)
+                                  || n.StartsWith("Click \"Extract", StringComparison.Ordinal));
+        netlist.Notes.Add($"OCR: recognised {words.Count} word(s) in {sw.ElapsedMilliseconds} ms.");
+        netlist.Notes.Add($"OCR: {refs.Count} reference designator(s) matched the regex {OcrEngine.ReferenceDesignatorRegex}.");
+        if (words.Count > 0)
+        {
+            // Include the top-10 lowest-confidence words as a quick troubleshooting hint
+            // (they're usually noise; if good designators show low confidence,
+            // it's a clue the threshold/contrast need tuning).
+            var lowConf = words.OrderBy(w => w.Confidence).Take(10).ToList();
+            netlist.Notes.Add($"OCR: lowest-confidence sample → " +
+                string.Join(", ", lowConf.Select(w => $"\"{w.Text}\"@{w.Confidence:F2}")));
+        }
+
+        return new ExtractionStats(words.Count, refs.Count, sw.ElapsedMilliseconds);
     }
 
-    /// <summary>Render the netlist as a human-readable text block for the UI
-    /// preview pane. Mirrors the BRD preview behaviour of the CSV pipeline.</summary>
-    public static string FormatPreview(Netlist netlist)
+    /// <summary>Split a reference designator into its letter prefix and numeric
+    /// suffix for sorting. \"IC42\" → (\"IC\", 42).</summary>
+    private static (string prefix, int number) SplitPrefix(string designator)
     {
-        var sb = new System.Text.StringBuilder();
-
-        sb.AppendLine("# Netlist preview");
-        if (!string.IsNullOrEmpty(netlist.Source))
-            sb.AppendLine($"# Source: {netlist.Source}");
-        sb.AppendLine();
-
-        if (netlist.Notes.Count > 0)
-        {
-            sb.AppendLine("## Extractor notes");
-            foreach (var n in netlist.Notes)
-                sb.Append("  - ").AppendLine(n);
-            sb.AppendLine();
-        }
-
-        sb.AppendLine($"## Nets ({netlist.Nets.Count})");
-        for (int i = 0; i < netlist.Nets.Count; i++)
-            sb.Append("  ").Append(i + 1).Append(' ').AppendLine(netlist.Nets[i].Name);
-        if (netlist.Nets.Count == 0) sb.AppendLine("  (none)");
-        sb.AppendLine();
-
-        sb.AppendLine($"## Components ({netlist.Components.Count})");
-        if (netlist.Components.Count == 0) sb.AppendLine("  (none)");
-        foreach (var c in netlist.Components)
-        {
-            sb.Append("  ").Append(c.Reference);
-            if (!string.IsNullOrEmpty(c.Value)) sb.Append("  [").Append(c.Value).Append(']');
-            sb.AppendLine();
-            foreach (var p in c.Pins)
-            {
-                sb.Append("      pin ").Append(p.Number);
-                if (!string.IsNullOrEmpty(p.Name)) sb.Append(" (").Append(p.Name).Append(')');
-                sb.Append(" → ").AppendLine(string.IsNullOrEmpty(p.Net) ? "(NC)" : p.Net);
-            }
-        }
-
-        return sb.ToString();
+        int i = 0;
+        while (i < designator.Length && !char.IsDigit(designator[i])) i++;
+        string prefix = designator.Substring(0, i);
+        int n = 0;
+        int.TryParse(designator.AsSpan(i), out n);
+        return (prefix, n);
     }
 
     private static string PixelFormatName(PixelFormat pf) => pf switch
@@ -141,4 +155,9 @@ public static class SchematicImageLoader
         PixelFormat.Format1bppIndexed  => "1bpp indexed",
         _ => pf.ToString(),
     };
+
+    // ----- Old API kept for callers we haven't updated yet -----
+
+    /// <summary>Render the netlist as a human-readable text block.</summary>
+    public static string FormatPreview(Netlist netlist) => NetlistTextFormat.Format(netlist);
 }
