@@ -26,6 +26,31 @@ public static class OcrEngine
     public static readonly Regex ReferenceDesignatorRegex =
         new(@"^[A-Z]{1,3}\d{1,4}$", RegexOptions.Compiled);
 
+    /// <summary>Regex for a net label. Matches schematic-style power/signal
+    /// names: uppercase letters and digits, optional leading sign and trailing
+    /// 'V', allowing underscores and the '#'/'_N' active-low suffix. Examples
+    /// that match:   GND, VCC, VDD, VSS, 3V3, +5V, -12V, +3V3, VBUS,
+    ///               SDA, SCL, MOSI, MISO, SCK, RX, TX, CLK, RESET, IRQ,
+    ///               D0, D1, A0, A15, EN, OE, WE, CS_N, RESET#, IO_0.
+    /// Designators (R1, C12, …) are excluded by <see cref="IsLikelyNetLabel"/>.</summary>
+    public static readonly Regex NetLabelRegex =
+        new(@"^[+\-]?[A-Z][A-Z0-9_]{0,15}[#]?$", RegexOptions.Compiled);
+
+    /// <summary>True if <paramref name="word"/> looks like a net label —
+    /// matches <see cref="NetLabelRegex"/>, has at least one letter, and is
+    /// NOT a reference designator.</summary>
+    public static bool IsLikelyNetLabel(string word)
+    {
+        if (string.IsNullOrEmpty(word)) return false;
+        if (ReferenceDesignatorRegex.IsMatch(word)) return false;
+        if (!NetLabelRegex.IsMatch(word)) return false;
+        // Must contain at least one letter so pure-number tokens like "42"
+        // don't get misclassified as a net.
+        bool hasLetter = false;
+        foreach (char c in word) if (c is >= 'A' and <= 'Z') { hasLetter = true; break; }
+        return hasLetter;
+    }
+
     /// <summary>Locate the tessdata folder relative to the running executable.
     /// Throws a helpful error if the eng.traineddata file is missing.</summary>
     public static string ResolveTessdataPath()

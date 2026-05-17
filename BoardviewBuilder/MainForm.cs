@@ -729,7 +729,7 @@ public sealed class MainForm : Form
                                                 .Replace("\n", Environment.NewLine);
             SchemOk(status,
                 $"OCR: {stats.WordsRecognised} word(s) → {stats.ReferenceDesignatorsFound} " +
-                $"reference designator(s) in {stats.ElapsedMs} ms.");
+                $"designator(s), {stats.NetLabelsFound} net label(s) in {stats.ElapsedMs} ms.");
         }
         catch (Exception ex)
         {

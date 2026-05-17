@@ -72,6 +72,7 @@ public static class SchematicImageLoader
     public readonly record struct ExtractionStats(
         int WordsRecognised,
         int ReferenceDesignatorsFound,
+        int NetLabelsFound,
         long ElapsedMs);
 
     /// <summary>
@@ -89,37 +90,60 @@ public static class SchematicImageLoader
         var words = OcrEngine.RecognizeWords(processed);
         sw.Stop();
 
-        // Deduplicate by uppercased text — Tesseract can return the same
-        // designator multiple times if a label is split across two boxes.
-        // We keep the FIRST occurrence's bounding box.
+        // Two parallel dedup tables, one for designators, one for net labels.
+        // Both key off the uppercased+cleaned text. First occurrence wins so
+        // we keep its bounding box for later wire-tracing.
         var refs = new Dictionary<string, OcrEngine.Word>(StringComparer.Ordinal);
+        var nets = new Dictionary<string, OcrEngine.Word>(StringComparer.Ordinal);
+
         foreach (var w in words)
         {
             // Strip common OCR clutter — colons, commas, trailing punctuation.
             string cleaned = w.Text.Trim().Trim(':', ',', '.', ';');
-            // Up-case so "r1" and "R1" merge.
+            // Up-case so "r1" and "R1" merge, "gnd" and "GND" merge, etc.
             string upper = cleaned.ToUpperInvariant();
-            if (OcrEngine.ReferenceDesignatorRegex.IsMatch(upper) && !refs.ContainsKey(upper))
-                refs[upper] = w with { Text = upper };
+
+            if (OcrEngine.ReferenceDesignatorRegex.IsMatch(upper))
+            {
+                if (!refs.ContainsKey(upper))
+                    refs[upper] = w with { Text = upper };
+            }
+            else if (OcrEngine.IsLikelyNetLabel(upper))
+            {
+                if (!nets.ContainsKey(upper))
+                    nets[upper] = w with { Text = upper };
+            }
         }
 
         // Order designators by prefix letters, then numeric suffix, so the
         // netlist looks tidy (C1, C2, C3, R1, R2, U1, …).
-        var ordered = refs.Values
+        var orderedRefs = refs.Values
             .OrderBy(w => SplitPrefix(w.Text).prefix, StringComparer.Ordinal)
             .ThenBy(w => SplitPrefix(w.Text).number)
             .ToList();
 
         netlist.Components.Clear();
-        foreach (var w in ordered)
+        foreach (var w in orderedRefs)
             netlist.Components.Add(new NetlistComponent { Reference = w.Text });
+
+        // Power nets first (GND / VCC / VDD / VSS / 3V3 / +5V / -12V / VBUS),
+        // then everything else alphabetically. Keeps the netlist easy to scan.
+        var orderedNets = nets.Values
+            .OrderBy(w => PowerNetRank(w.Text))
+            .ThenBy(w => w.Text, StringComparer.Ordinal)
+            .ToList();
+
+        netlist.Nets.Clear();
+        foreach (var w in orderedNets)
+            netlist.Nets.Add(new NetlistNet { Name = w.Text });
 
         // Refresh diagnostic notes so the user can see what happened.
         // Keep the original "File:" / "Image:" notes; drop the prior extractor notes.
         netlist.Notes.RemoveAll(n => n.StartsWith("OCR:", StringComparison.Ordinal)
                                   || n.StartsWith("Click \"Extract", StringComparison.Ordinal));
         netlist.Notes.Add($"OCR: recognised {words.Count} word(s) in {sw.ElapsedMilliseconds} ms.");
-        netlist.Notes.Add($"OCR: {refs.Count} reference designator(s) matched the regex {OcrEngine.ReferenceDesignatorRegex}.");
+        netlist.Notes.Add($"OCR: {refs.Count} reference designator(s) matched {OcrEngine.ReferenceDesignatorRegex}.");
+        netlist.Notes.Add($"OCR: {nets.Count} net label(s) matched {OcrEngine.NetLabelRegex}.");
         if (words.Count > 0)
         {
             // Include the top-10 lowest-confidence words as a quick troubleshooting hint
@@ -130,8 +154,19 @@ public static class SchematicImageLoader
                 string.Join(", ", lowConf.Select(w => $"\"{w.Text}\"@{w.Confidence:F2}")));
         }
 
-        return new ExtractionStats(words.Count, refs.Count, sw.ElapsedMilliseconds);
+        return new ExtractionStats(words.Count, refs.Count, nets.Count, sw.ElapsedMilliseconds);
     }
+
+    /// <summary>Sort rank for a net name — lower comes first. Returns 0 for
+    /// canonical power nets, 1 for anything else. Keeps GND/VCC/3V3 etc. at
+    /// the top of the netlist regardless of alphabetical order.</summary>
+    private static int PowerNetRank(string netName) => netName switch
+    {
+        "GND" or "AGND" or "DGND" or "GNDA" or "GNDD" or "PGND" or "SGND" => 0,
+        "VCC" or "VDD" or "VSS" or "VBUS" or "VBAT" or "VIN" or "VOUT"    => 0,
+        "3V3" or "+3V3" or "+3.3V" or "+5V" or "+12V" or "-12V" or "+1V8" => 0,
+        _ => 1,
+    };
 
     /// <summary>Split a reference designator into its letter prefix and numeric
     /// suffix for sorting. \"IC42\" → (\"IC\", 42).</summary>
