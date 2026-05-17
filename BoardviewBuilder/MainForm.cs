@@ -728,8 +728,11 @@ public sealed class MainForm : Form
             netlistText.Text = NetlistTextFormat.Format(_schematic.Netlist)
                                                 .Replace("\n", Environment.NewLine);
             SchemOk(status,
-                $"OCR: {stats.WordsRecognised} word(s) → {stats.ReferenceDesignatorsFound} " +
-                $"designator(s), {stats.NetLabelsFound} net label(s) in {stats.ElapsedMs} ms.");
+                $"OCR+Trace: {stats.WordsRecognised} word(s) → " +
+                $"{stats.ReferenceDesignatorsFound} designator(s), " +
+                $"{stats.NetLabelsFound} net label(s), " +
+                $"{stats.TracedNets} net(s), " +
+                $"{stats.Connections} pin↔net connection(s) in {stats.ElapsedMs} ms.");
         }
         catch (Exception ex)
         {

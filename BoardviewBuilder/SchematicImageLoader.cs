@@ -6,13 +6,13 @@ namespace BoardviewBuilder;
 /// Loads a raster schematic (JPEG / PNG / BMP) and produces a <see cref="Netlist"/>.
 ///
 /// STATUS:
-///   * <see cref="Load"/>           — loads the image, captures metadata, returns an empty Netlist.
-///   * <see cref="ExtractFromBitmap"/> — runs OCR (Tesseract) on a processed bitmap
-///                                     and populates the Netlist with reference designators.
+///   * <see cref="Load"/>              — loads the image, captures metadata, returns an empty Netlist.
+///   * <see cref="ExtractFromBitmap"/> — runs OCR (Tesseract) + wire-tracing on a processed bitmap
+///                                       and populates the Netlist with components, nets, and a
+///                                       single best-guess pin per component.
 ///
 /// The two operations are split so the UI can run extraction repeatedly on the
 /// CURRENT processed (threshold/grayscale/etc.) bitmap without reloading the file.
-/// Future stages will extend ExtractFromBitmap with net-label OCR and wire tracing.
 /// </summary>
 public static class SchematicImageLoader
 {
@@ -73,34 +73,30 @@ public static class SchematicImageLoader
         int WordsRecognised,
         int ReferenceDesignatorsFound,
         int NetLabelsFound,
+        int TracedNets,
+        int Connections,
         long ElapsedMs);
 
     /// <summary>
     /// Run OCR over <paramref name="processed"/> (typically the user's
-    /// adjusted/binarised image), filter the words for reference designators,
-    /// and replace the components in <paramref name="netlist"/>.
-    ///
-    /// Nets are NOT touched — net-label extraction comes in a later step.
-    /// Existing components/pins in <paramref name="netlist"/> are REPLACED;
-    /// the caller is expected to re-apply manual edits after extraction.
+    /// adjusted/binarised image), classify the recognised words into
+    /// designators and net labels, then run a wire-tracing pass to build
+    /// best-guess connectivity. The result replaces <paramref name="netlist"/>'s
+    /// Components and Nets; the caller is expected to re-apply manual edits
+    /// after extraction.
     /// </summary>
     public static ExtractionStats ExtractFromBitmap(Bitmap processed, Netlist netlist)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var words = OcrEngine.RecognizeWords(processed);
-        sw.Stop();
 
-        // Two parallel dedup tables, one for designators, one for net labels.
-        // Both key off the uppercased+cleaned text. First occurrence wins so
-        // we keep its bounding box for later wire-tracing.
+        // ---- Classify OCR words into designators and net labels ----
         var refs = new Dictionary<string, OcrEngine.Word>(StringComparer.Ordinal);
         var nets = new Dictionary<string, OcrEngine.Word>(StringComparer.Ordinal);
 
         foreach (var w in words)
         {
-            // Strip common OCR clutter — colons, commas, trailing punctuation.
             string cleaned = w.Text.Trim().Trim(':', ',', '.', ';');
-            // Up-case so "r1" and "R1" merge, "gnd" and "GND" merge, etc.
             string upper = cleaned.ToUpperInvariant();
 
             if (OcrEngine.ReferenceDesignatorRegex.IsMatch(upper))
@@ -115,46 +111,105 @@ public static class SchematicImageLoader
             }
         }
 
-        // Order designators by prefix letters, then numeric suffix, so the
-        // netlist looks tidy (C1, C2, C3, R1, R2, U1, …).
+        // ---- Build the input list for the wire tracer ----
+        var textBoxes = new List<WireTracer.TextBoxInfo>(refs.Count + nets.Count);
+        foreach (var kv in refs)
+            textBoxes.Add(new WireTracer.TextBoxInfo(
+                kv.Key, kv.Value.Bounds, WireTracer.TextKind.Designator));
+        foreach (var kv in nets)
+            textBoxes.Add(new WireTracer.TextBoxInfo(
+                kv.Key, kv.Value.Bounds, WireTracer.TextKind.NetLabel));
+
+        // ---- Trace wires ----
+        var (tracedGroups, traceStats) = WireTracer.Trace(processed, textBoxes);
+
+        // Merge groups by name — a schematic typically has many "GND" labels
+        // that are all logically the same net, even if the tracer's CC pass
+        // saw them as separate groups (they're separate ground stubs on the
+        // page, but logically one net).
+        var membersByName = new Dictionary<string, List<WireTracer.TextBoxInfo>>(StringComparer.Ordinal);
+        foreach (var grp in tracedGroups)
+        {
+            if (!membersByName.TryGetValue(grp.Name, out var list))
+            {
+                list = new List<WireTracer.TextBoxInfo>();
+                membersByName[grp.Name] = list;
+            }
+            list.AddRange(grp.Members);
+        }
+
+        // ---- Build components, sorted by prefix+number ----
+        netlist.Components.Clear();
+        var componentByRef = new Dictionary<string, NetlistComponent>(StringComparer.Ordinal);
+
         var orderedRefs = refs.Values
             .OrderBy(w => SplitPrefix(w.Text).prefix, StringComparer.Ordinal)
             .ThenBy(w => SplitPrefix(w.Text).number)
             .ToList();
-
-        netlist.Components.Clear();
         foreach (var w in orderedRefs)
-            netlist.Components.Add(new NetlistComponent { Reference = w.Text });
+        {
+            var c = new NetlistComponent { Reference = w.Text };
+            componentByRef[w.Text] = c;
+            netlist.Components.Add(c);
+        }
 
-        // Power nets first (GND / VCC / VDD / VSS / 3V3 / +5V / -12V / VBUS),
-        // then everything else alphabetically. Keeps the netlist easy to scan.
-        var orderedNets = nets.Values
-            .OrderBy(w => PowerNetRank(w.Text))
-            .ThenBy(w => w.Text, StringComparer.Ordinal)
+        // ---- Build nets, power rails first, then alphabetical ----
+        netlist.Nets.Clear();
+        int connections = 0;
+        var orderedNetNames = membersByName.Keys
+            .OrderBy(n => PowerNetRank(n))
+            .ThenBy(n => n, StringComparer.Ordinal)
             .ToList();
 
-        netlist.Nets.Clear();
-        foreach (var w in orderedNets)
-            netlist.Nets.Add(new NetlistNet { Name = w.Text });
+        foreach (var netName in orderedNetNames)
+        {
+            netlist.Nets.Add(new NetlistNet { Name = netName });
 
-        // Refresh diagnostic notes so the user can see what happened.
-        // Keep the original "File:" / "Image:" notes; drop the prior extractor notes.
+            // For each designator the tracer associated with this net, add
+            // ONE pin to the component pointing at this net. Sequential pin
+            // numbers — true pin numbers need symbol detection (future step).
+            var memberRefs = membersByName[netName]
+                .Where(m => m.Kind == WireTracer.TextKind.Designator)
+                .Select(m => m.Text)
+                .Distinct(StringComparer.Ordinal);
+
+            foreach (var refName in memberRefs)
+            {
+                if (!componentByRef.TryGetValue(refName, out var comp)) continue;
+                int pinNumber = comp.Pins.Count + 1;
+                comp.Pins.Add(new NetlistPin
+                {
+                    Number = pinNumber.ToString(),
+                    Net = netName,
+                });
+                connections++;
+            }
+        }
+
+        sw.Stop();
+
+        // ---- Refresh diagnostic notes ----
         netlist.Notes.RemoveAll(n => n.StartsWith("OCR:", StringComparison.Ordinal)
+                                  || n.StartsWith("Trace:", StringComparison.Ordinal)
                                   || n.StartsWith("Click \"Extract", StringComparison.Ordinal));
-        netlist.Notes.Add($"OCR: recognised {words.Count} word(s) in {sw.ElapsedMilliseconds} ms.");
-        netlist.Notes.Add($"OCR: {refs.Count} reference designator(s) matched {OcrEngine.ReferenceDesignatorRegex}.");
-        netlist.Notes.Add($"OCR: {nets.Count} net label(s) matched {OcrEngine.NetLabelRegex}.");
+        netlist.Notes.Add($"OCR: recognised {words.Count} word(s).");
+        netlist.Notes.Add($"OCR: {refs.Count} reference designator(s), {nets.Count} net label(s).");
+        netlist.Notes.Add($"Trace: {traceStats.ConnectedComponents} CC(s), " +
+                          $"{traceStats.Nets} traced group(s) → {membersByName.Count} named net(s), " +
+                          $"{traceStats.IsolatedTextBoxes} isolated text box(es), " +
+                          $"{connections} pin↔net connection(s), " +
+                          $"trace took {traceStats.ElapsedMs} ms.");
         if (words.Count > 0)
         {
-            // Include the top-10 lowest-confidence words as a quick troubleshooting hint
-            // (they're usually noise; if good designators show low confidence,
-            // it's a clue the threshold/contrast need tuning).
             var lowConf = words.OrderBy(w => w.Confidence).Take(10).ToList();
             netlist.Notes.Add($"OCR: lowest-confidence sample → " +
                 string.Join(", ", lowConf.Select(w => $"\"{w.Text}\"@{w.Confidence:F2}")));
         }
 
-        return new ExtractionStats(words.Count, refs.Count, nets.Count, sw.ElapsedMilliseconds);
+        return new ExtractionStats(
+            words.Count, refs.Count, nets.Count,
+            membersByName.Count, connections,
+            sw.ElapsedMilliseconds);
     }
 
     /// <summary>Sort rank for a net name — lower comes first. Returns 0 for
