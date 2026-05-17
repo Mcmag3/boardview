@@ -14,11 +14,12 @@ namespace BoardviewBuilder;
 ///
 /// Current coverage:
 ///   * R / RN  → resistor: rectangle (IEC) OR zig-zag (US).
-///   * C       → capacitor: a pair of short PARALLEL line segments separated
-///               by a small gap (the two plates). Works for both non-polarised
-///               (two straight lines) and polarised (straight + curved — the
-///               curved plate registers as a short segment too, since we don't
-///               demand both are perfectly straight).
+///   * C       → capacitor: a pair of small PARALLEL RECTANGULAR plates
+///               separated by a small gap. Each plate can be either filled
+///               (solid block) or unfilled (outline) — schematic styles vary,
+///               and polarised caps are typically drawn as one filled + one
+///               unfilled rectangle. Falls back to a parallel line-segment
+///               detector if no rectangle pair is found (thin-stroke plates).
 ///   * (others will be added incrementally — diode, BJT, IC.)
 ///
 /// Implementation notes:
@@ -142,7 +143,164 @@ public static class SymbolDetector
             Cv2.Rectangle(bin, local, Scalar.Black, thickness: -1);
         }
 
+        // ---- Attempt 1: paired rectangular plates (filled and/or outlined) ---
+        var rectPair = FindCapacitorRectangles(bin, textBbox, sx, sy);
+        if (rectPair != null) return rectPair;
+
+        // ---- Attempt 2: paired thin line plates (legacy thin-stroke style) ---
         return FindCapacitorPlates(bin, textBbox, sx, sy);
+    }
+
+    /// <summary>Look for TWO parallel rectangular plates in the masked crop.
+    /// Each plate can be filled (solid block) or unfilled (outlined). The
+    /// pair is accepted when the rectangles are similar in size, parallel
+    /// (within ~15°), and separated by a small perpendicular gap on the
+    /// order of the plate's short side.</summary>
+    private static SymbolHit? FindCapacitorRectangles(Mat bin, DrawingRectangle textBbox, int cropOriginX, int cropOriginY)
+    {
+        float textH = Math.Max(8, textBbox.Height);
+
+        // Plate sizing (each individual plate, NOT the pair):
+        //   - long side ≈ 0.8 - 3.5 × text height
+        //   - short side ≈ 0.05 - 1.2 × text height (thin for filled bars,
+        //     a bit thicker for small outlined rectangles)
+        float minLong  = textH * 0.8f;
+        float maxLong  = textH * 3.5f;
+        float minShort = Math.Max(2f, textH * 0.05f);
+        float maxShort = textH * 1.2f;
+
+        // Gap between the two plates (perpendicular distance, plate-to-plate):
+        float minGap = Math.Max(2f, textH * 0.15f);
+        float maxGap = textH * 1.5f;
+        // Angle tolerance between the two plates' long-side orientation.
+        float angleTol = 15f;
+        // Long-side length similarity (the more relaxed dimension).
+        float lenSimilarity = 0.55f;
+        // Lateral offset (along the plate's long-side direction) of the two
+        // midpoints, as a fraction of the average long side. 0 = perfectly
+        // centred face-to-face; 1 = end-to-end. We allow up to 0.6.
+        float maxLateralFrac = 0.6f;
+
+        // Find ALL external contours, with chain approximation. We use Tree
+        // mode so we get both filled (no children) and outlined (one child)
+        // rectangles equally — we just don't care about the children.
+        Cv2.FindContours(bin, out OpenCvSharp.Point[][] contours, out _,
+                         RetrievalModes.External, ContourApproximationModes.ApproxSimple);
+
+        // Convert acceptable contours to rotated-rect descriptors.
+        var plates = new List<(RotatedRect rr, float lon, float shor, float angle)>();
+        foreach (var contour in contours)
+        {
+            if (contour.Length < 4) continue;
+
+            var rr = Cv2.MinAreaRect(contour);
+            float wRR = rr.Size.Width;
+            float hRR = rr.Size.Height;
+            float lon  = Math.Max(wRR, hRR);
+            float shor = Math.Max(1, Math.Min(wRR, hRR));
+            if (lon  < minLong  || lon  > maxLong)  continue;
+            if (shor < minShort || shor > maxShort) continue;
+
+            // Reject contours that are clearly not rectangular: the contour
+            // area should fill most of the rotated-rect bbox area. Use a
+            // forgiving 0.55 threshold (outlined rects with thin strokes
+            // have a chunk of their bbox unfilled when measured this way).
+            double contourArea = Cv2.ContourArea(contour);
+            double rrArea = (double)wRR * hRR;
+            float fillRatio = (float)(contourArea / Math.Max(1, rrArea));
+            if (fillRatio < 0.40f) continue;
+
+            // Long-side orientation in degrees, normalised to [-90, 90].
+            // OpenCV's rotated-rect angle is the rotation of the FIRST side
+            // (width side). If width >= height, that side IS the long side,
+            // otherwise the long side is perpendicular to it.
+            float a = rr.Angle;
+            if (hRR > wRR) a += 90f;
+            while (a >  90f) a -= 180f;
+            while (a < -90f) a += 180f;
+
+            plates.Add((rr, lon, shor, a));
+        }
+        if (plates.Count < 2) return null;
+
+        SymbolHit? best = null;
+        float bestScore = 0f;
+
+        for (int i = 0; i < plates.Count; i++)
+        for (int j = i + 1; j < plates.Count; j++)
+        {
+            var a = plates[i];
+            var b = plates[j];
+
+            // Same orientation?
+            float angDiff = Math.Abs(a.angle - b.angle);
+            if (angDiff > 90) angDiff = 180 - angDiff;
+            if (angDiff > angleTol) continue;
+
+            // Similar long-side length?
+            float lenRatio = Math.Min(a.lon, b.lon) / Math.Max(a.lon, b.lon);
+            if (lenRatio < lenSimilarity) continue;
+
+            // Direction along plate A's long side, and perpendicular to it.
+            float rad = a.angle * MathF.PI / 180f;
+            float ux = MathF.Cos(rad);
+            float uy = MathF.Sin(rad);
+            // Perpendicular = (-uy, ux)
+
+            float dxm = b.rr.Center.X - a.rr.Center.X;
+            float dym = b.rr.Center.Y - a.rr.Center.Y;
+
+            // Plate-to-plate gap = perpendicular distance MINUS the half-thickness
+            // of each plate (so we measure the open space between the bodies,
+            // not centre-to-centre).
+            float centrePerp = MathF.Abs(-uy * dxm + ux * dym);
+            float gap = centrePerp - 0.5f * (a.shor + b.shor);
+            if (gap < minGap || gap > maxGap) continue;
+
+            // Lateral offset along plate direction.
+            float lateral = MathF.Abs(ux * dxm + uy * dym);
+            float avgLon = (a.lon + b.lon) * 0.5f;
+            if (lateral > maxLateralFrac * avgLon) continue;
+
+            // Score: prefer similar lengths, small gap relative to plate length,
+            // small lateral offset, and minimal angle difference.
+            float lenScore  = lenRatio;
+            float gapScore  = 1f - Math.Min(1f, gap / (avgLon * 0.8f));
+            float latScore  = 1f - Math.Min(1f, lateral / (avgLon * maxLateralFrac));
+            float angScore  = 1f - Math.Min(1f, angDiff / angleTol);
+            float score = 0.30f * lenScore + 0.30f * gapScore
+                        + 0.20f * latScore + 0.20f * angScore;
+
+            if (score > bestScore)
+            {
+                // Bbox = union of the two rotated-rect axis-aligned bboxes.
+                var aPts = a.rr.Points();
+                var bPts = b.rr.Points();
+                float minX = float.MaxValue, minY = float.MaxValue;
+                float maxX = float.MinValue, maxY = float.MinValue;
+                foreach (var p in aPts.Concat(bPts))
+                {
+                    if (p.X < minX) minX = p.X;
+                    if (p.Y < minY) minY = p.Y;
+                    if (p.X > maxX) maxX = p.X;
+                    if (p.Y > maxY) maxY = p.Y;
+                }
+                int bx = Math.Max(0, (int)MathF.Floor(minX));
+                int by = Math.Max(0, (int)MathF.Floor(minY));
+                int bw = Math.Max(1, (int)MathF.Ceiling(maxX - minX));
+                int bh = Math.Max(1, (int)MathF.Ceiling(maxY - minY));
+
+                bestScore = score;
+                best = new SymbolHit
+                {
+                    Bounds = new DrawingRectangle(bx + cropOriginX, by + cropOriginY, bw, bh),
+                    Kind = "capacitor-rect-pair",
+                    Score = score,
+                };
+            }
+        }
+
+        return bestScore >= 0.50f ? best : null;
     }
 
     /// <summary>Look for two short parallel line segments separated by a small
