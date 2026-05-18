@@ -399,10 +399,17 @@ public sealed class MainForm : Form
         var loadNetBtn    = new Button { Text = "Load netlist…",    AutoSize = true, Margin = new Padding(3) };
         var saveNetBtn    = new Button { Text = "Save netlist…",    AutoSize = true, Margin = new Padding(3) };
         var extractBtn    = new Button { Text = "Extract from image", AutoSize = true, Margin = new Padding(3), Enabled = false };
+        var labelBtn      = new Button { Text = "Label for training…", AutoSize = true, Margin = new Padding(3) };
         bottom.Controls.Add(applyEditsBtn, 1, 0);
         bottom.Controls.Add(loadNetBtn,    2, 0);
         bottom.Controls.Add(saveNetBtn,    3, 0);
         bottom.Controls.Add(extractBtn,    4, 0);
+        // Reserve one more column for the label button.
+        bottom.ColumnCount = 6;
+        bottom.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        bottom.Controls.Add(labelBtn, 5, 0);
+        labelBtn.Click += (_, _) => OpenLabelEditor(status);
+
 
         root.Controls.Add(bottom, 0, 3);
 
@@ -832,8 +839,66 @@ public sealed class MainForm : Form
         }
     }
 
+    /// <summary>Open the YOLO-format labelling editor on the currently
+    /// displayed processed bitmap. If the user has already run "Extract from
+    /// image" we pre-fill the editor with the auto-detected symbol bboxes
+    /// (currently just resistors) classified as "R" — the user only has to
+    /// correct/add the missing ones (caps, diodes, etc.).</summary>
+    private void OpenLabelEditor(Label status)
+    {
+        if (_displayBitmap is null)
+        {
+            SchemWarn(status, "Load a schematic image first.");
+            return;
+        }
+
+        // Suggested filename stem = source image filename, no extension.
+        string stem = _schematic?.SourcePath is { Length: > 0 } p
+                    ? Path.GetFileNameWithoutExtension(p)
+                    : "schematic";
+
+        // Pre-fill: every symbol bbox we already detected. We assume the
+        // existing geometric detector only fires for R designators today; if
+        // that changes later we can dispatch on the designator's first letter.
+        var prefill = new List<LabelEditor.LabelBox>();
+        if (_lastOcr != null)
+        {
+            int classR = Array.IndexOf(LabelEditor.DefaultClasses, "R");
+            int classC = Array.IndexOf(LabelEditor.DefaultClasses, "C");
+            int classD = Array.IndexOf(LabelEditor.DefaultClasses, "D");
+            int classQ = Array.IndexOf(LabelEditor.DefaultClasses, "Q");
+            int classU = Array.IndexOf(LabelEditor.DefaultClasses, "U");
+            int classL = Array.IndexOf(LabelEditor.DefaultClasses, "L");
+            int classOther = Array.IndexOf(LabelEditor.DefaultClasses, "OTHER");
+
+            foreach (var kv in _lastOcr.SymbolBoxes)
+            {
+                if (kv.Value.Width <= 0 || kv.Value.Height <= 0) continue;
+                char first = kv.Key.Length > 0 ? char.ToUpperInvariant(kv.Key[0]) : '?';
+                int cls = first switch
+                {
+                    'R' => classR,
+                    'C' => classC,
+                    'D' => classD,
+                    'Q' => classQ,
+                    'U' => classU,
+                    'L' => classL,
+                    _ => classOther,
+                };
+                prefill.Add(new LabelEditor.LabelBox(kv.Value, cls));
+            }
+        }
+
+        // Use the displayed bitmap directly — the editor doesn't dispose it,
+        // and labels are saved in this bitmap's coordinate system.
+        using var editor = new LabelEditor(_displayBitmap, stem, prefill);
+        editor.ShowDialog(this);
+        SchemOk(status, "Label editor closed.");
+    }
+
     private static void SchemOk(Label status, string msg)   { status.ForeColor = Color.DarkGreen; status.Text = msg; }
     private static void SchemWarn(Label status, string msg) { status.ForeColor = Color.Firebrick;  status.Text = "Error: " + msg; }
+
 
     protected override void Dispose(bool disposing)
     {
