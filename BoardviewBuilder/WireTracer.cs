@@ -51,6 +51,8 @@ public static class WireTracer
         int Nets,
         int IsolatedTextBoxes,
         int SymbolsFound,
+        int SymbolsViaYolo,
+        int SymbolsViaGeometric,
         long ElapsedMs);
 
     /// <summary>Full tracer output — nets + diagnostics + per-designator
@@ -63,6 +65,10 @@ public static class WireTracer
         /// keys = no symbol found near that designator (isolated label).</summary>
         public required IReadOnlyDictionary<string, Rectangle> SymbolBoxes { get; init; }
     }
+
+    // Singleton YOLO detector — loaded once on first use, cached for the session.
+    private static SymbolDetectorYolo? _yoloDetector;
+    private static bool _yoloLoadAttempted;
 
     /// <summary>Trace wire connectivity. <paramref name="processed"/> can be
     /// any pixel format — it'll be internally rebound to 24bpp RGB for the
@@ -94,10 +100,39 @@ public static class WireTracer
         // Collect ALL text bboxes once for the SymbolDetector mask step.
         var allTextBoxes = texts.Select(t => t.Bounds).ToList();
 
+        // Try to load YOLO detector (once per session).
+        if (!_yoloLoadAttempted)
+        {
+            _yoloLoadAttempted = true;
+            _yoloDetector = SymbolDetectorYolo.TryLoad("models/symbols.onnx", "models/symbols.classes.txt");
+        }
+
+        // Run YOLO detection ONCE on the full image if available.
+        List<SymbolDetector.SymbolHit>? yoloHits = null;
+        Dictionary<char, List<SymbolDetector.SymbolHit>>? yoloByClass = null;
+        if (_yoloDetector != null)
+        {
+            yoloHits = _yoloDetector.Detect(processed);
+            // Build spatial lookup by first letter of class name
+            yoloByClass = new Dictionary<char, List<SymbolDetector.SymbolHit>>();
+            foreach (var hit in yoloHits)
+            {
+                char key = hit.Kind.Length > 0 ? char.ToUpperInvariant(hit.Kind[0]) : '?';
+                if (!yoloByClass.TryGetValue(key, out var list))
+                {
+                    list = new List<SymbolDetector.SymbolHit>();
+                    yoloByClass[key] = list;
+                }
+                list.Add(hit);
+            }
+        }
+
         // 4+5) Per-text CC assignment.
         var textCC = new int[texts.Count];
         var symbolBoxes = new Dictionary<string, Rectangle>(StringComparer.Ordinal);
         int symbolsFound = 0;
+        int symbolsViaYolo = 0;
+        int symbolsViaGeometric = 0;
 
         for (int i = 0; i < texts.Count; i++)
         {
@@ -108,25 +143,60 @@ public static class WireTracer
             }
             else
             {
-                // Designator: pick by the FIRST LETTER of the designator —
-                //   "R" → shape-aware resistor detector (OpenCvSharp).
-                //   anything else → fallback to "largest non-letter CC nearby"
-                //   (Option A behaviour) until we add a dedicated shape detector.
+                // Designator: try YOLO first, then geometric fallback.
                 string desig = texts[i].Text;
-                char letter = desig.Length > 0 ? desig[0] : '?';
+                char letter = desig.Length > 0 ? char.ToUpperInvariant(desig[0]) : '?';
+                var textBbox = texts[i].Bounds;
 
                 Rectangle? shapeBbox = null;
-                if (letter == 'R')
+                bool usedYolo = false;
+
+                // Try YOLO: find the closest detection of matching class
+                // whose centre is within ~6× text size of the designator.
+                if (yoloByClass != null && yoloByClass.TryGetValue(letter, out var candidates))
                 {
-                    var hit = SymbolDetector.FindResistorNear(
-                        processed, texts[i].Bounds, allTextBoxes, binaryThreshold);
-                    if (hit != null) shapeBbox = hit.Bounds;
+                    float textCx = textBbox.X + textBbox.Width * 0.5f;
+                    float textCy = textBbox.Y + textBbox.Height * 0.5f;
+                    float maxDist = Math.Max(textBbox.Width, textBbox.Height) * 6f;
+
+                    SymbolDetector.SymbolHit? bestHit = null;
+                    float bestDist = float.MaxValue;
+
+                    foreach (var hit in candidates)
+                    {
+                        float hitCx = hit.Bounds.X + hit.Bounds.Width * 0.5f;
+                        float hitCy = hit.Bounds.Y + hit.Bounds.Height * 0.5f;
+                        float dist = MathF.Sqrt((hitCx - textCx) * (hitCx - textCx) +
+                                                (hitCy - textCy) * (hitCy - textCy));
+                        if (dist < maxDist && dist < bestDist)
+                        {
+                            bestDist = dist;
+                            bestHit = hit;
+                        }
+                    }
+
+                    if (bestHit != null)
+                    {
+                        shapeBbox = bestHit.Bounds;
+                        usedYolo = true;
+                    }
                 }
-                else if (letter == 'C')
+
+                // Geometric fallback if YOLO didn't find anything
+                if (!shapeBbox.HasValue)
                 {
-                    var hit = SymbolDetector.FindCapacitorNear(
-                        processed, texts[i].Bounds, allTextBoxes, binaryThreshold);
-                    if (hit != null) shapeBbox = hit.Bounds;
+                    if (letter == 'R')
+                    {
+                        var hit = SymbolDetector.FindResistorNear(
+                            processed, textBbox, allTextBoxes, binaryThreshold);
+                        if (hit != null) shapeBbox = hit.Bounds;
+                    }
+                    else if (letter == 'C')
+                    {
+                        var hit = SymbolDetector.FindCapacitorNear(
+                            processed, textBbox, allTextBoxes, binaryThreshold);
+                        if (hit != null) shapeBbox = hit.Bounds;
+                    }
                 }
 
                 if (shapeBbox.HasValue)
@@ -138,16 +208,19 @@ public static class WireTracer
                     textCC[i] = symCC;
                     symbolBoxes[desig] = shapeBbox.Value;
                     symbolsFound++;
+                    if (usedYolo) symbolsViaYolo++;
+                    else symbolsViaGeometric++;
                 }
                 else
                 {
                     // Fallback: largest non-forbidden CC in an expanded search box.
-                    int symCC = FindSymbolCC(labels, w, h, texts[i].Bounds, forbidden);
+                    int symCC = FindSymbolCC(labels, w, h, textBbox, forbidden);
                     textCC[i] = symCC;
                     if (symCC != 0)
                     {
                         symbolBoxes[desig] = ccBoxes[symCC];
                         symbolsFound++;
+                        symbolsViaGeometric++;
                     }
                 }
             }
@@ -180,7 +253,8 @@ public static class WireTracer
         }
 
         sw.Stop();
-        var stats = new TraceStats(ccCount, byCC.Count, isolated, symbolsFound, sw.ElapsedMilliseconds);
+        var stats = new TraceStats(ccCount, byCC.Count, isolated, symbolsFound,
+                                   symbolsViaYolo, symbolsViaGeometric, sw.ElapsedMilliseconds);
         return new TraceResult
         {
             Nets = byCC.Values.ToList(),

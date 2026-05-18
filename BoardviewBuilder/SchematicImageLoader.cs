@@ -211,8 +211,11 @@ public static class SchematicImageLoader
                                   || n.StartsWith("Click \"Extract", StringComparison.Ordinal));
         netlist.Notes.Add($"OCR: recognised {words.Count} word(s).");
         netlist.Notes.Add($"OCR: {refs.Count} reference designator(s), {nets.Count} net label(s).");
+        string symbolNote = traceStats.SymbolsViaYolo > 0
+            ? $"{traceStats.SymbolsFound} symbol(s) located ({traceStats.SymbolsViaYolo} YOLO, {traceStats.SymbolsViaGeometric} geometric)"
+            : $"{traceStats.SymbolsFound} symbol(s) located";
         netlist.Notes.Add($"Trace: {traceStats.ConnectedComponents} CC(s), " +
-                          $"{traceStats.SymbolsFound} symbol(s) located, " +
+                          $"{symbolNote}, " +
                           $"{traceStats.Nets} traced group(s) → {membersByName.Count} named net(s), " +
                           $"{traceStats.IsolatedTextBoxes} isolated text box(es), " +
                           $"{connections} pin↔net connection(s), " +
