@@ -13,6 +13,18 @@ static class Program
         if (args.Length >= 2)
             return RunCli(args);
 
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.ThreadException += (s, e) =>
+        {
+            MessageBox.Show($"Thread Exception:\n\n{e.Exception}", "Error",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        };
+        AppDomain.CurrentDomain.UnhandledException += (s, e) =>
+        {
+            MessageBox.Show($"Unhandled Exception:\n\n{e.ExceptionObject}", "Error",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        };
+
         ApplicationConfiguration.Initialize();
         Application.Run(new MainForm());
         return 0;

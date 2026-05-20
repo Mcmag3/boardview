@@ -45,6 +45,19 @@ public static class WireTracer
         public List<TextBoxInfo> Members { get; } = new();
     }
 
+    /// <summary>A detected pin where a wire connects to a symbol.</summary>
+    public readonly record struct DetectedPin(
+        string Designator,      // e.g. "R1", "C2"
+        Point Location,         // center point of the pin
+        int WireCC,             // CC label of the wire connected to this pin
+        string Side);           // "Top", "Bottom", "Left", "Right"
+
+    /// <summary>A wire segment (bounding box of a single wire CC).</summary>
+    public readonly record struct WireSegment(
+        int CCLabel,
+        Rectangle Bounds,
+        List<string> ConnectedPins);  // pins that connect to this wire
+
     /// <summary>Per-trace diagnostics for the status bar / notes.</summary>
     public readonly record struct TraceStats(
         int ConnectedComponents,
@@ -53,6 +66,11 @@ public static class WireTracer
         int SymbolsFound,
         int SymbolsViaYolo,
         int SymbolsViaGeometric,
+        bool YoloLoaded,
+        int YoloRawDetections,
+        string YoloDebugInfo,
+        int PinsDetected,
+        int WireSegments,
         long ElapsedMs);
 
     /// <summary>Full tracer output — nets + diagnostics + per-designator
@@ -64,6 +82,12 @@ public static class WireTracer
         /// <summary>Designator text → bbox of the detected symbol CC. Missing
         /// keys = no symbol found near that designator (isolated label).</summary>
         public required IReadOnlyDictionary<string, Rectangle> SymbolBoxes { get; init; }
+        /// <summary>Raw YOLO detections (for debug overlay).</summary>
+        public required IReadOnlyList<SymbolDetector.SymbolHit> YoloHits { get; init; }
+        /// <summary>Detected pins where wires connect to symbols.</summary>
+        public required IReadOnlyList<DetectedPin> Pins { get; init; }
+        /// <summary>Wire segments with their bounding boxes.</summary>
+        public required IReadOnlyList<WireSegment> Wires { get; init; }
     }
 
     // Singleton YOLO detector — loaded once on first use, cached for the session.
@@ -110,9 +134,14 @@ public static class WireTracer
         // Run YOLO detection ONCE on the full image if available.
         List<SymbolDetector.SymbolHit>? yoloHits = null;
         Dictionary<char, List<SymbolDetector.SymbolHit>>? yoloByClass = null;
+        int yoloRawCount = 0;
+        string yoloDebug = "";
         if (_yoloDetector != null)
         {
-            yoloHits = _yoloDetector.Detect(processed);
+            // Use very low confidence threshold (0.05) since we have limited training data
+            yoloHits = _yoloDetector.Detect(processed, confThreshold: 0.05f);
+            yoloRawCount = yoloHits.Count;
+            yoloDebug = _yoloDetector.LastDebugInfo;
             // Build spatial lookup by first letter of class name
             yoloByClass = new Dictionary<char, List<SymbolDetector.SymbolHit>>();
             foreach (var hit in yoloHits)
@@ -226,7 +255,49 @@ public static class WireTracer
             }
         }
 
-        // 6) Group by CC label.
+        // 6) NEW: Pin detection - find where wires cross YOLO box edges
+        var detectedPins = new List<DetectedPin>();
+        if (yoloHits != null)
+        {
+            foreach (var hit in yoloHits)
+            {
+                // Use the YOLO class as designator (e.g., "R", "C", "Q")
+                // Try to find matching designator text nearby
+                string desig = hit.Kind;
+
+                // Find the closest designator text to this YOLO box
+                float hitCx = hit.Bounds.X + hit.Bounds.Width * 0.5f;
+                float hitCy = hit.Bounds.Y + hit.Bounds.Height * 0.5f;
+                float maxDist = Math.Max(hit.Bounds.Width, hit.Bounds.Height) * 3f;
+
+                foreach (var text in texts)
+                {
+                    if (text.Kind != TextKind.Designator) continue;
+                    string textUpper = text.Text.ToUpperInvariant();
+                    char textLetter = textUpper.Length > 0 ? textUpper[0] : '?';
+                    char hitLetter = hit.Kind.Length > 0 ? char.ToUpperInvariant(hit.Kind[0]) : '?';
+                    if (textLetter != hitLetter) continue;
+
+                    float textCx = text.Bounds.X + text.Bounds.Width * 0.5f;
+                    float textCy = text.Bounds.Y + text.Bounds.Height * 0.5f;
+                    float dist = MathF.Sqrt((hitCx - textCx) * (hitCx - textCx) + (hitCy - textCy) * (hitCy - textCy));
+                    if (dist < maxDist)
+                    {
+                        desig = textUpper;
+                        break;
+                    }
+                }
+
+                // Detect pins at YOLO box edges
+                var edgePins = DetectPinsAtYoloEdges(ink, w, h, hit.Bounds, desig, allTextBoxes);
+                detectedPins.AddRange(edgePins);
+            }
+        }
+
+        // No wire segments for now (removed)
+        var wireSegments = new List<WireSegment>();
+
+        // 7) Group by CC label (using original labels for net grouping).
         var byCC = new Dictionary<int, TracedNet>();
         int isolated = 0;
         for (int i = 0; i < texts.Count; i++)
@@ -241,7 +312,7 @@ public static class WireTracer
             grp.Members.Add(texts[i]);
         }
 
-        // 7) Name each group.
+        // 8) Name each group.
         int autoIdx = 1;
         foreach (var grp in byCC.Values)
         {
@@ -254,12 +325,17 @@ public static class WireTracer
 
         sw.Stop();
         var stats = new TraceStats(ccCount, byCC.Count, isolated, symbolsFound,
-                                   symbolsViaYolo, symbolsViaGeometric, sw.ElapsedMilliseconds);
+                                   symbolsViaYolo, symbolsViaGeometric,
+                                   _yoloDetector != null, yoloRawCount, yoloDebug,
+                                   detectedPins.Count, wireSegments.Count, sw.ElapsedMilliseconds);
         return new TraceResult
         {
             Nets = byCC.Values.ToList(),
             Stats = stats,
             SymbolBoxes = symbolBoxes,
+            YoloHits = yoloHits ?? new List<SymbolDetector.SymbolHit>(),
+            Pins = detectedPins,
+            Wires = wireSegments,
         };
     }
 
@@ -524,5 +600,179 @@ public static class WireTracer
         foreach (var kv in counts)
             if (kv.Value > bestCount) { best = kv.Key; bestCount = kv.Value; }
         return best;
+    }
+
+    // -----------------------------------------------------------------------
+    //  Pin detection at YOLO bounding box edges.
+    //  Scans each edge for runs of ink pixels (wires) that cross the edge.
+    //  Excludes any ink that falls inside OCR text boxes.
+    //  A pin is detected when ink pixels cross the YOLO box boundary.
+    // -----------------------------------------------------------------------
+    private static List<DetectedPin> DetectPinsAtYoloEdges(
+        bool[] ink, int w, int h, Rectangle bbox, string designator, List<Rectangle> textBoxes)
+    {
+        var pins = new List<DetectedPin>();
+
+        // Helper: check if a point is inside any text box
+        bool IsInsideText(int px, int py)
+        {
+            foreach (var tb in textBoxes)
+            {
+                if (px >= tb.X && px < tb.Right && py >= tb.Y && py < tb.Bottom)
+                    return true;
+            }
+            return false;
+        }
+
+        // Helper: check if ink continues outside the bbox (confirming it's a wire, not just edge of symbol)
+        bool HasInkOutside(int px, int py, string side, int checkDist = 8)
+        {
+            int dx = 0, dy = 0;
+            switch (side)
+            {
+                case "Top": dy = -1; break;
+                case "Bottom": dy = 1; break;
+                case "Left": dx = -1; break;
+                case "Right": dx = 1; break;
+            }
+
+            int inkCount = 0;
+            for (int d = 1; d <= checkDist; d++)
+            {
+                int nx = px + dx * d;
+                int ny = py + dy * d;
+                if (nx < 0 || nx >= w || ny < 0 || ny >= h) break;
+                if (IsInsideText(nx, ny)) return false; // Wire leads into text, not a real pin
+                if (ink[ny * w + nx]) inkCount++;
+            }
+            // Need at least 3 ink pixels outside to confirm it's a wire
+            return inkCount >= 3;
+        }
+
+        // Scan top edge
+        {
+            int y = bbox.Y;
+            if (y >= 0 && y < h)
+            {
+                int runStart = -1;
+                for (int x = bbox.X; x < bbox.Right && x < w; x++)
+                {
+                    if (x < 0) continue;
+                    bool isInk = ink[y * w + x] && !IsInsideText(x, y);
+                    if (isInk)
+                    {
+                        if (runStart < 0) runStart = x;
+                    }
+                    else if (runStart >= 0)
+                    {
+                        int cx = (runStart + x - 1) / 2;
+                        if (HasInkOutside(cx, y, "Top"))
+                            pins.Add(new DetectedPin(designator, new Point(cx, y), 0, "Top"));
+                        runStart = -1;
+                    }
+                }
+                if (runStart >= 0)
+                {
+                    int cx = (runStart + Math.Min(bbox.Right, w) - 1) / 2;
+                    if (HasInkOutside(cx, y, "Top"))
+                        pins.Add(new DetectedPin(designator, new Point(cx, y), 0, "Top"));
+                }
+            }
+        }
+
+        // Scan bottom edge
+        {
+            int y = bbox.Bottom - 1;
+            if (y >= 0 && y < h)
+            {
+                int runStart = -1;
+                for (int x = bbox.X; x < bbox.Right && x < w; x++)
+                {
+                    if (x < 0) continue;
+                    bool isInk = ink[y * w + x] && !IsInsideText(x, y);
+                    if (isInk)
+                    {
+                        if (runStart < 0) runStart = x;
+                    }
+                    else if (runStart >= 0)
+                    {
+                        int cx = (runStart + x - 1) / 2;
+                        if (HasInkOutside(cx, y, "Bottom"))
+                            pins.Add(new DetectedPin(designator, new Point(cx, y), 0, "Bottom"));
+                        runStart = -1;
+                    }
+                }
+                if (runStart >= 0)
+                {
+                    int cx = (runStart + Math.Min(bbox.Right, w) - 1) / 2;
+                    if (HasInkOutside(cx, y, "Bottom"))
+                        pins.Add(new DetectedPin(designator, new Point(cx, y), 0, "Bottom"));
+                }
+            }
+        }
+
+        // Scan left edge
+        {
+            int x = bbox.X;
+            if (x >= 0 && x < w)
+            {
+                int runStart = -1;
+                for (int y = bbox.Y; y < bbox.Bottom && y < h; y++)
+                {
+                    if (y < 0) continue;
+                    bool isInk = ink[y * w + x] && !IsInsideText(x, y);
+                    if (isInk)
+                    {
+                        if (runStart < 0) runStart = y;
+                    }
+                    else if (runStart >= 0)
+                    {
+                        int cy = (runStart + y - 1) / 2;
+                        if (HasInkOutside(x, cy, "Left"))
+                            pins.Add(new DetectedPin(designator, new Point(x, cy), 0, "Left"));
+                        runStart = -1;
+                    }
+                }
+                if (runStart >= 0)
+                {
+                    int cy = (runStart + Math.Min(bbox.Bottom, h) - 1) / 2;
+                    if (HasInkOutside(x, cy, "Left"))
+                        pins.Add(new DetectedPin(designator, new Point(x, cy), 0, "Left"));
+                }
+            }
+        }
+
+        // Scan right edge
+        {
+            int x = bbox.Right - 1;
+            if (x >= 0 && x < w)
+            {
+                int runStart = -1;
+                for (int y = bbox.Y; y < bbox.Bottom && y < h; y++)
+                {
+                    if (y < 0) continue;
+                    bool isInk = ink[y * w + x] && !IsInsideText(x, y);
+                    if (isInk)
+                    {
+                        if (runStart < 0) runStart = y;
+                    }
+                    else if (runStart >= 0)
+                    {
+                        int cy = (runStart + y - 1) / 2;
+                        if (HasInkOutside(x, cy, "Right"))
+                            pins.Add(new DetectedPin(designator, new Point(x, cy), 0, "Right"));
+                        runStart = -1;
+                    }
+                }
+                if (runStart >= 0)
+                {
+                    int cy = (runStart + Math.Min(bbox.Bottom, h) - 1) / 2;
+                    if (HasInkOutside(x, cy, "Right"))
+                        pins.Add(new DetectedPin(designator, new Point(x, cy), 0, "Right"));
+                }
+            }
+        }
+
+        return pins;
     }
 }

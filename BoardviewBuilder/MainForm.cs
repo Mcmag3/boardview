@@ -49,6 +49,8 @@ public sealed class MainForm : Form
     private readonly Label _adjBrightnessVal;
     private readonly Label _adjContrastVal;
     private readonly Label _adjThresholdVal;
+    private readonly CheckBox _hideOcrBoxes;
+    private readonly CheckBox _showPins;
 
     private SchematicImageLoader.LoadResult? _schematic;
     private Bitmap? _displayBitmap;          // processed image currently shown
@@ -90,7 +92,8 @@ public sealed class MainForm : Form
          _adjGrayscale, _adjInvert, _adjBrightness, _adjContrast,
          _adjThresholdEnabled, _adjThreshold,
          _adjRotateBtn, _adjResetBtn,
-         _adjBrightnessVal, _adjContrastVal, _adjThresholdVal) = BuildSchematicTab(schemTab);
+         _adjBrightnessVal, _adjContrastVal, _adjThresholdVal,
+         _hideOcrBoxes, _showPins) = BuildSchematicTab(schemTab);
     }
 
     // ---------------------------------------------------------------------
@@ -240,7 +243,8 @@ public sealed class MainForm : Form
              CheckBox gray, CheckBox invert, TrackBar brightness, TrackBar contrast,
              CheckBox thresholdEnabled, TrackBar threshold,
              Button rotate, Button reset,
-             Label brightVal, Label contrastVal, Label threshVal) BuildSchematicTab(TabPage tab)
+             Label brightVal, Label contrastVal, Label threshVal,
+             CheckBox hideOcrBoxes, CheckBox showPins) BuildSchematicTab(TabPage tab)
     {
         var root = new TableLayoutPanel
         {
@@ -298,41 +302,45 @@ public sealed class MainForm : Form
         };
         var adjLayout = new TableLayoutPanel
         {
-            Dock = DockStyle.Fill, ColumnCount = 12, RowCount = 1, AutoSize = true,
+            Dock = DockStyle.Fill, ColumnCount = 15, RowCount = 1, AutoSize = true,
         };
-        for (int i = 0; i < 12; i++) adjLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        for (int i = 0; i < 15; i++) adjLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         adj.Controls.Add(adjLayout);
 
         var cbGray = new CheckBox { Text = "Grayscale", AutoSize = true, Margin = new Padding(3, 8, 8, 3) };
         var cbInv  = new CheckBox { Text = "Invert",    AutoSize = true, Margin = new Padding(3, 8, 8, 3) };
+        var cbHideOcr = new CheckBox { Text = "Hide OCR boxes", AutoSize = true, Margin = new Padding(3, 8, 8, 3) };
+        var cbShowPins = new CheckBox { Text = "Show Pins", AutoSize = true, Margin = new Padding(3, 8, 8, 3), Checked = true };
         adjLayout.Controls.Add(cbGray, 0, 0);
         adjLayout.Controls.Add(cbInv,  1, 0);
+        adjLayout.Controls.Add(cbHideOcr, 2, 0);
+        adjLayout.Controls.Add(cbShowPins, 3, 0);
 
-        adjLayout.Controls.Add(new Label { Text = "Brightness:", AutoSize = true, Margin = new Padding(8, 8, 3, 3) }, 2, 0);
+        adjLayout.Controls.Add(new Label { Text = "Brightness:", AutoSize = true, Margin = new Padding(8, 8, 3, 3) }, 5, 0);
         var tbBright = new TrackBar { Minimum = -100, Maximum = 100, Value = 0, TickFrequency = 25, Width = 120, AutoSize = false, Height = 30 };
-        adjLayout.Controls.Add(tbBright, 3, 0);
+        adjLayout.Controls.Add(tbBright, 6, 0);
         var lblBright = new Label { Text = "0", AutoSize = true, Margin = new Padding(3, 8, 3, 3), MinimumSize = new Size(28, 0) };
-        adjLayout.Controls.Add(lblBright, 4, 0);
+        adjLayout.Controls.Add(lblBright, 7, 0);
 
-        adjLayout.Controls.Add(new Label { Text = "Contrast:", AutoSize = true, Margin = new Padding(8, 8, 3, 3) }, 5, 0);
+        adjLayout.Controls.Add(new Label { Text = "Contrast:", AutoSize = true, Margin = new Padding(8, 8, 3, 3) }, 8, 0);
         var tbCont = new TrackBar { Minimum = -100, Maximum = 100, Value = 0, TickFrequency = 25, Width = 120, AutoSize = false, Height = 30 };
-        adjLayout.Controls.Add(tbCont, 6, 0);
+        adjLayout.Controls.Add(tbCont, 9, 0);
         var lblCont = new Label { Text = "0", AutoSize = true, Margin = new Padding(3, 8, 3, 3), MinimumSize = new Size(28, 0) };
-        adjLayout.Controls.Add(lblCont, 7, 0);
+        adjLayout.Controls.Add(lblCont, 10, 0);
 
         var cbThresh = new CheckBox { Text = "Threshold", AutoSize = true, Margin = new Padding(8, 8, 3, 3) };
-        adjLayout.Controls.Add(cbThresh, 8, 0);
+        adjLayout.Controls.Add(cbThresh, 11, 0);
         var tbThresh = new TrackBar { Minimum = 0, Maximum = 255, Value = 160, TickFrequency = 32, Width = 120, AutoSize = false, Height = 30, Enabled = false };
-        adjLayout.Controls.Add(tbThresh, 9, 0);
+        adjLayout.Controls.Add(tbThresh, 12, 0);
         var lblThresh = new Label { Text = "160", AutoSize = true, Margin = new Padding(3, 8, 3, 3), MinimumSize = new Size(32, 0) };
-        adjLayout.Controls.Add(lblThresh, 10, 0);
+        adjLayout.Controls.Add(lblThresh, 13, 0);
 
         var rotateBtn = new Button { Text = "Rotate 90°", AutoSize = true, Margin = new Padding(8, 4, 3, 4) };
         var resetBtn  = new Button { Text = "Reset",      AutoSize = true, Margin = new Padding(3, 4, 3, 4) };
         var btnFlow = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, Margin = new Padding(0) };
         btnFlow.Controls.Add(rotateBtn);
         btnFlow.Controls.Add(resetBtn);
-        adjLayout.Controls.Add(btnFlow, 11, 0);
+        adjLayout.Controls.Add(btnFlow, 14, 0);
 
         root.Controls.Add(adj, 0, 1);
 
@@ -453,6 +461,8 @@ public sealed class MainForm : Form
         tbBright.ValueChanged   += (_, _) => OnAdjChanged();
         tbCont.ValueChanged     += (_, _) => OnAdjChanged();
         tbThresh.ValueChanged   += (_, _) => OnAdjChanged();
+        cbHideOcr.CheckedChanged += (_, _) => RefreshProcessedImage(img, zoom);
+        cbShowPins.CheckedChanged += (_, _) => RefreshProcessedImage(img, zoom);
 
         rotateBtn.Click += (_, _) =>
         {
@@ -481,7 +491,8 @@ public sealed class MainForm : Form
                 applyEditsBtn, saveNetBtn, loadNetBtn, extractBtn,
                 cbGray, cbInv, tbBright, tbCont, cbThresh, tbThresh,
                 rotateBtn, resetBtn,
-                lblBright, lblCont, lblThresh);
+                lblBright, lblCont, lblThresh,
+                cbHideOcr, cbShowPins);
     }
 
     // ---- Image loading -------------------------------------------------------
@@ -490,8 +501,11 @@ public sealed class MainForm : Form
     {
         using var dlg = new OpenFileDialog
         {
-            Title = "Open schematic image",
-            Filter = "Schematic images (*.jpg;*.jpeg;*.png;*.bmp)|*.jpg;*.jpeg;*.png;*.bmp|All files (*.*)|*.*",
+            Title = "Open schematic image or PDF",
+            Filter = "Schematic files (*.jpg;*.jpeg;*.png;*.bmp;*.pdf)|*.jpg;*.jpeg;*.png;*.bmp;*.pdf|" +
+                     "Images (*.jpg;*.jpeg;*.png;*.bmp)|*.jpg;*.jpeg;*.png;*.bmp|" +
+                     "PDF files (*.pdf)|*.pdf|" +
+                     "All files (*.*)|*.*",
             CheckFileExists = true,
         };
         if (File.Exists(pathBox.Text))
@@ -518,7 +532,19 @@ public sealed class MainForm : Form
             _schematic?.Dispose();
             _schematic = null;
 
-            _schematic = SchematicImageLoader.Load(path);
+            // Check if PDF with multiple pages
+            int pageIndex = 0;
+            if (Path.GetExtension(path).Equals(".pdf", StringComparison.OrdinalIgnoreCase))
+            {
+                int pageCount = SchematicImageLoader.GetPdfPageCount(path);
+                if (pageCount > 1)
+                {
+                    pageIndex = ShowPdfPageSelector(path, pageCount);
+                    if (pageIndex < 0) return; // User cancelled
+                }
+            }
+
+            _schematic = SchematicImageLoader.Load(path, pageIndex);
             _adjustments.Reset();
             _lastOcr = null;   // new image → clear overlay
             RefreshProcessedImage(img, zoom);
@@ -548,6 +574,63 @@ public sealed class MainForm : Form
         }
     }
 
+    /// <summary>Show a dialog to select which page of a multi-page PDF to load.</summary>
+    private static int ShowPdfPageSelector(string path, int pageCount)
+    {
+        using var dlg = new Form
+        {
+            Text = "Select PDF Page",
+            Width = 350,
+            Height = 180,
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MaximizeBox = false,
+            MinimizeBox = false,
+        };
+
+        var label = new Label
+        {
+            Text = $"This PDF has {pageCount} pages.\nSelect which page to load:",
+            Location = new Point(15, 15),
+            AutoSize = true,
+        };
+        dlg.Controls.Add(label);
+
+        var combo = new ComboBox
+        {
+            Location = new Point(15, 55),
+            Width = 300,
+            DropDownStyle = ComboBoxStyle.DropDownList,
+        };
+        for (int i = 0; i < pageCount; i++)
+            combo.Items.Add($"Page {i + 1}");
+        combo.SelectedIndex = 0;
+        dlg.Controls.Add(combo);
+
+        var okBtn = new Button
+        {
+            Text = "OK",
+            DialogResult = DialogResult.OK,
+            Location = new Point(150, 100),
+            Width = 80,
+        };
+        dlg.Controls.Add(okBtn);
+
+        var cancelBtn = new Button
+        {
+            Text = "Cancel",
+            DialogResult = DialogResult.Cancel,
+            Location = new Point(235, 100),
+            Width = 80,
+        };
+        dlg.Controls.Add(cancelBtn);
+
+        dlg.AcceptButton = okBtn;
+        dlg.CancelButton = cancelBtn;
+
+        return dlg.ShowDialog() == DialogResult.OK ? combo.SelectedIndex : -1;
+    }
+
     /// <summary>Recompute the processed display bitmap from the original image
     /// and the current adjustments, paint any OCR debug overlay on top, then
     /// assign it to the PictureBox.</summary>
@@ -560,7 +643,9 @@ public sealed class MainForm : Form
         // Bboxes are in the processed-image coordinate system at extraction time;
         // they stay valid as long as the user doesn't rotate after extracting.
         if (_lastOcr != null)
-            DrawOcrOverlay(newBmp, _lastOcr);
+            DrawOcrOverlay(newBmp, _lastOcr,
+                hideOcrText: _hideOcrBoxes.Checked,
+                showPins: _showPins.Checked);
 
         var oldImage = img.Image;
         img.Image = newBmp;
@@ -572,6 +657,7 @@ public sealed class MainForm : Form
     }
 
     /// <summary>Draw classified OCR bounding boxes onto <paramref name="bmp"/>.
+    ///   * magenta = YOLO raw detections (always drawn)
     ///   * red    = reference designators (matched the designator regex)
     ///   * green  = net labels             (matched the net-label regex)
     ///   * yellow = other recognised words (didn't match either — useful for
@@ -579,9 +665,13 @@ public sealed class MainForm : Form
     ///   * blue   = detected component SYMBOL for a designator (the largest
     ///              non-text connected component the tracer found near the
     ///              designator text — i.e. where the wires actually attach).
+    ///   * cyan   = wire segments (bounding boxes of traced wire CCs)
+    ///   * orange circles = detected pins where wires connect to symbols
     /// Each text box is labelled with its recognised text; each symbol box
-    /// is labelled with the designator it belongs to.</summary>
-    private static void DrawOcrOverlay(Bitmap bmp, SchematicImageLoader.ExtractionResult ocr)
+    /// is labelled with the designator it belongs to.
+    /// When <paramref name="hideOcrText"/> is true, only YOLO boxes are drawn.</summary>
+    private static void DrawOcrOverlay(Bitmap bmp, SchematicImageLoader.ExtractionResult ocr,
+        bool hideOcrText = false, bool showPins = true)
     {
         var designators = new HashSet<string>(ocr.Designators.Keys, StringComparer.Ordinal);
         var netLabels   = new HashSet<string>(ocr.NetLabels.Keys,   StringComparer.Ordinal);
@@ -594,43 +684,129 @@ public sealed class MainForm : Form
         using var penNet     = new Pen(Color.LimeGreen, 2f);
         using var penOther   = new Pen(Color.FromArgb(180, 200, 160, 0), 1f); // dim yellow
         using var penSymbol  = new Pen(Color.DodgerBlue, 3f);                  // bold blue
+        using var penYolo    = new Pen(Color.Magenta, 2f);                     // YOLO detections
+        using var penPin     = new Pen(Color.OrangeRed, 2f);                   // pin circles
         using var brushRef   = new SolidBrush(Color.Red);
         using var brushNet   = new SolidBrush(Color.LimeGreen);
         using var brushOther = new SolidBrush(Color.FromArgb(200, 200, 160, 0));
         using var brushSym   = new SolidBrush(Color.DodgerBlue);
+        using var brushYolo  = new SolidBrush(Color.Magenta);
+        using var brushPin   = new SolidBrush(Color.OrangeRed);
         using var labelFont  = new Font(FontFamily.GenericSansSerif, 9f, FontStyle.Bold);
         using var symFont    = new Font(FontFamily.GenericSansSerif, 10f, FontStyle.Bold);
+        using var pinFont    = new Font(FontFamily.GenericSansSerif, 7f, FontStyle.Regular);
 
-        // ---- Pass 1: symbol bboxes (blue, drawn FIRST so text boxes overlay on top) ----
-        foreach (var kv in ocr.SymbolBoxes)
+        // ---- Pass 0: YOLO raw detections (magenta, drawn FIRST so everything else overlays) ----
+        // Filter to only show highest confidence box when multiple overlap significantly
+        var filteredYolo = FilterOverlappingYoloHits(ocr.YoloHits);
+        foreach (var hit in filteredYolo)
         {
-            var r = kv.Value;
+            var r = hit.Bounds;
             if (r.Width <= 0 || r.Height <= 0) continue;
-            g.DrawRectangle(penSymbol, r);
-            // Label the symbol bbox with the designator name in the top-left corner.
-            g.DrawString(kv.Key, symFont, brushSym, r.X + 2, r.Y + 2);
+            g.DrawRectangle(penYolo, r);
+            // Label with class name and confidence
+            string label = $"{hit.Kind} {hit.Score:P0}";
+            g.DrawString(label, labelFont, brushYolo, r.X + 2, r.Bottom + 2);
         }
 
-        // ---- Pass 2: text bboxes (red/green/yellow) ----
-        foreach (var w in ocr.AllWords)
+        // ---- Pass 1 & 2: OCR boxes (skip if hideOcrText is true) ----
+        if (!hideOcrText)
         {
-            string cleaned = w.Text.Trim().Trim(':', ',', '.', ';');
-            string upper = cleaned.ToUpperInvariant();
+            // ---- Pass 1: symbol bboxes (blue) ----
+            foreach (var kv in ocr.SymbolBoxes)
+            {
+                var r = kv.Value;
+                if (r.Width <= 0 || r.Height <= 0) continue;
+                g.DrawRectangle(penSymbol, r);
+                // Label the symbol bbox with the designator name in the top-left corner.
+                g.DrawString(kv.Key, symFont, brushSym, r.X + 2, r.Y + 2);
+            }
 
-            Pen pen;
-            Brush brush;
-            if (designators.Contains(upper))     { pen = penRef;   brush = brushRef; }
-            else if (netLabels.Contains(upper))  { pen = penNet;   brush = brushNet; }
-            else                                  { pen = penOther; brush = brushOther; }
+            // ---- Pass 2: text bboxes (red/green/yellow) ----
+            foreach (var w in ocr.AllWords)
+            {
+                string cleaned = w.Text.Trim().Trim(':', ',', '.', ';');
+                string upper = cleaned.ToUpperInvariant();
 
-            var r = w.Bounds;
-            if (r.Width <= 0 || r.Height <= 0) continue;
-            g.DrawRectangle(pen, r);
+                Pen pen;
+                Brush brush;
+                if (designators.Contains(upper))     { pen = penRef;   brush = brushRef; }
+                else if (netLabels.Contains(upper))  { pen = penNet;   brush = brushNet; }
+                else                                  { pen = penOther; brush = brushOther; }
 
-            int textY = r.Y - 14;
-            if (textY < 0) textY = r.Bottom + 1;
-            g.DrawString(w.Text, labelFont, brush, r.X, textY);
+                var r = w.Bounds;
+                if (r.Width <= 0 || r.Height <= 0) continue;
+                g.DrawRectangle(pen, r);
+
+                int textY = r.Y - 14;
+                if (textY < 0) textY = r.Bottom + 1;
+                g.DrawString(w.Text, labelFont, brush, r.X, textY);
+            }
         }
+
+        // ---- Pass 3: Pins (orange circles at YOLO box edges where wires cross) ----
+        if (showPins)
+        {
+            const int pinRadius = 5;
+            foreach (var pin in ocr.Pins)
+            {
+                int cx = pin.Location.X;
+                int cy = pin.Location.Y;
+
+                // Draw filled circle for pin
+                g.FillEllipse(brushPin, cx - pinRadius, cy - pinRadius, pinRadius * 2, pinRadius * 2);
+                g.DrawEllipse(penPin, cx - pinRadius, cy - pinRadius, pinRadius * 2, pinRadius * 2);
+
+                // Draw small label showing designator.side
+                string pinLabel = $"{pin.Designator}.{pin.Side[0]}";
+                g.DrawString(pinLabel, pinFont, brushPin, cx + pinRadius + 2, cy - 5);
+            }
+        }
+    }
+
+    /// <summary>Filter YOLO hits to only keep highest confidence when boxes overlap significantly (IoU > 0.3).</summary>
+    private static List<SymbolDetector.SymbolHit> FilterOverlappingYoloHits(IReadOnlyList<SymbolDetector.SymbolHit> hits)
+    {
+        if (hits.Count <= 1) return hits.ToList();
+
+        // Sort by confidence descending
+        var sorted = hits.OrderByDescending(h => h.Score).ToList();
+        var kept = new List<SymbolDetector.SymbolHit>();
+        var suppressed = new bool[sorted.Count];
+
+        for (int i = 0; i < sorted.Count; i++)
+        {
+            if (suppressed[i]) continue;
+            kept.Add(sorted[i]);
+
+            // Suppress any lower-confidence boxes that overlap significantly
+            for (int j = i + 1; j < sorted.Count; j++)
+            {
+                if (suppressed[j]) continue;
+                float iou = ComputeIoU(sorted[i].Bounds, sorted[j].Bounds);
+                if (iou > 0.3f)
+                    suppressed[j] = true;
+            }
+        }
+        return kept;
+    }
+
+    /// <summary>Compute Intersection over Union for two rectangles.</summary>
+    private static float ComputeIoU(Rectangle a, Rectangle b)
+    {
+        int x1 = Math.Max(a.Left, b.Left);
+        int y1 = Math.Max(a.Top, b.Top);
+        int x2 = Math.Min(a.Right, b.Right);
+        int y2 = Math.Min(a.Bottom, b.Bottom);
+
+        if (x2 <= x1 || y2 <= y1) return 0f;
+
+        float intersection = (x2 - x1) * (y2 - y1);
+        float areaA = a.Width * a.Height;
+        float areaB = b.Width * b.Height;
+        float union = areaA + areaB - intersection;
+
+        return union > 0 ? intersection / union : 0f;
     }
 
     private static void ResizePictureBoxToZoom(PictureBox img, TrackBar zoom)

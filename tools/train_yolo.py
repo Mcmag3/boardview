@@ -38,7 +38,14 @@ def main():
     # Paths relative to this script
     script_dir = Path(__file__).parent.resolve()
     repo_root = script_dir.parent
-    dataset_dir = repo_root / "dataset"
+
+    # Check both possible dataset locations:
+    # 1. BoardviewBuilder/dataset/ (where the C# app saves when run from bin/)
+    # 2. dataset/ (repo root, legacy location)
+    dataset_dir = repo_root / "BoardviewBuilder" / "dataset"
+    if not dataset_dir.exists():
+        dataset_dir = repo_root / "dataset"
+
     images_dir = dataset_dir / "images"
     labels_dir = dataset_dir / "labels"
     classes_file = dataset_dir / "classes.txt"
@@ -134,17 +141,31 @@ def main():
 
     model = YOLO("yolov8n.pt")  # Start from pretrained weights
 
+    # Augmentation for schematic symbols
+    # Use flips to cover 0°, 90°, 180°, 270° orientations (more stable than continuous rotation)
     results = model.train(
         data=str(data_yaml),
-        epochs=100,
+        epochs=200,        # More epochs
         imgsz=640,
-        batch=16,
-        patience=20,  # Early stopping
+        batch=8,           # Smaller batch for small dataset
+        patience=40,       # More patience
         save=True,
         project=str(script_dir / "runs"),
         name="symbols",
         exist_ok=True,
         verbose=True,
+        # Conservative augmentation - flips cover rotations better than continuous rotation
+        degrees=0.0,       # No continuous rotation (causes issues with small datasets)
+        flipud=0.5,        # Vertical flip (0° ↔ 180°)
+        fliplr=0.5,        # Horizontal flip (0° ↔ mirrored, combined gives all orientations)
+        scale=0.3,         # Scale ±30%
+        translate=0.1,     # Mild translation
+        mosaic=1.0,        # Full mosaic (good for small datasets)
+        mixup=0.0,         # Disable mixup
+        copy_paste=0.0,    # Disable copy-paste
+        hsv_h=0.01,        # Minimal color variation
+        hsv_s=0.3,
+        hsv_v=0.2,
     )
 
     # Find best weights

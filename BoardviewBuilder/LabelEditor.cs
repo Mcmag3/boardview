@@ -41,7 +41,7 @@ public sealed class LabelEditor : Form
     private readonly ComboBox _classCombo;
     private readonly Label _statusLabel;
     private readonly FocusOnHoverPanel _scroll;
-    private readonly PictureBox _canvas;
+    private readonly DoubleBufferedPictureBox _canvas;
     private readonly TrackBar _zoom;
     private readonly Label _zoomLabel;
     private readonly Label _countLabel;
@@ -53,6 +53,7 @@ public sealed class LabelEditor : Form
     private bool _panning;
     private Point _panStartCursor;
     private Point _panStartScroll;
+    private bool _boxClickedNotDrawn;  // true when user clicked an existing box (vs just drew one)
 
     public LabelEditor(Bitmap image, string stem,
                        IEnumerable<LabelBox>? prefill = null)
@@ -80,9 +81,9 @@ public sealed class LabelEditor : Form
         // ---- Top row: class picker + zoom + actions ----
         var top = new TableLayoutPanel
         {
-            Dock = DockStyle.Fill, ColumnCount = 8, RowCount = 1, AutoSize = true,
+            Dock = DockStyle.Fill, ColumnCount = 10, RowCount = 1, AutoSize = true,
         };
-        for (int i = 0; i < 8; i++) top.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        for (int i = 0; i < 10; i++) top.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 
         top.Controls.Add(new Label { Text = "Class:", AutoSize = true, Margin = new Padding(3, 8, 3, 3) }, 0, 0);
         _classCombo = new ComboBox
@@ -95,8 +96,9 @@ public sealed class LabelEditor : Form
         _classCombo.SelectedIndex = 0;
         _classCombo.SelectedIndexChanged += (_, _) =>
         {
-            // Change the selected box's class on the fly.
-            if (_selected >= 0 && _selected < _boxes.Count)
+            // Only change the selected box's class if user clicked on an existing box.
+            // Don't change if they just drew a new box and are now selecting class for the NEXT box.
+            if (_boxClickedNotDrawn && _selected >= 0 && _selected < _boxes.Count)
             {
                 _boxes[_selected].ClassIndex = _classCombo.SelectedIndex;
                 _canvas!.Invalidate();
@@ -123,18 +125,26 @@ public sealed class LabelEditor : Form
         };
         top.Controls.Add(clearBtn, 3, 0);
 
-        top.Controls.Add(new Label { Text = "Zoom:", AutoSize = true, Margin = new Padding(12, 8, 3, 3) }, 4, 0);
+        var clearDatasetBtn = new Button { Text = "Clear dataset", AutoSize = true, Margin = new Padding(3), ForeColor = Color.DarkRed };
+        clearDatasetBtn.Click += (_, _) => ClearDataset();
+        top.Controls.Add(clearDatasetBtn, 4, 0);
+
+        var trainBtn = new Button { Text = "Train model", AutoSize = true, Margin = new Padding(3), ForeColor = Color.DarkBlue };
+        trainBtn.Click += (_, _) => TrainModel();
+        top.Controls.Add(trainBtn, 5, 0);
+
+        top.Controls.Add(new Label { Text = "Zoom:", AutoSize = true, Margin = new Padding(12, 8, 3, 3) }, 6, 0);
         _zoom = new TrackBar
         {
             Minimum = 10, Maximum = 800, TickFrequency = 50, Value = 100,
             Width = 200, AutoSize = false, Height = 30,
         };
-        top.Controls.Add(_zoom, 5, 0);
+        top.Controls.Add(_zoom, 7, 0);
         _zoomLabel = new Label { Text = "100%", AutoSize = true, Margin = new Padding(3, 8, 3, 3), MinimumSize = new Size(45, 0) };
-        top.Controls.Add(_zoomLabel, 6, 0);
+        top.Controls.Add(_zoomLabel, 8, 0);
 
         _countLabel = new Label { Text = "0 boxes", AutoSize = true, Margin = new Padding(12, 8, 3, 3) };
-        top.Controls.Add(_countLabel, 7, 0);
+        top.Controls.Add(_countLabel, 9, 0);
 
         root.Controls.Add(top, 0, 0);
 
@@ -145,7 +155,7 @@ public sealed class LabelEditor : Form
             AutoScroll = true,
             BackColor = Color.DimGray,
         };
-        _canvas = new PictureBox
+        _canvas = new DoubleBufferedPictureBox
         {
             SizeMode = PictureBoxSizeMode.Normal,    // we paint ourselves so we get pixel-perfect coords
             BackColor = Color.DimGray,
@@ -229,45 +239,54 @@ public sealed class LabelEditor : Form
     // -----------------------------------------------------------------------
     private void OnCanvasPaint(object? sender, PaintEventArgs e)
     {
-        var g = e.Graphics;
-        g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
-        g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;
-
-        // Draw the image scaled to the current canvas size.
-        g.DrawImage(_image, new Rectangle(0, 0, _canvas.Width, _canvas.Height));
-
-        float scale = _zoom.Value / 100f;
-        using var font = new Font(FontFamily.GenericSansSerif, 9f, FontStyle.Bold);
-
-        for (int i = 0; i < _boxes.Count; i++)
+        try
         {
-            var b = _boxes[i];
-            var r = new Rectangle(
-                (int)(b.Bounds.X * scale),
-                (int)(b.Bounds.Y * scale),
-                (int)(b.Bounds.Width * scale),
-                (int)(b.Bounds.Height * scale));
+            var g = e.Graphics;
+            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
+            g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;
 
-            Color col = ColorForClass(b.ClassIndex);
-            using var pen = new Pen(col, i == _selected ? 3f : 2f);
-            g.DrawRectangle(pen, r);
-            using var brush = new SolidBrush(col);
-            string text = ClassNameFor(b.ClassIndex);
-            g.DrawString(text, font, brush, r.X + 2, r.Y + 2);
+            // Draw the image scaled to the current canvas size.
+            if (_canvas.Width > 0 && _canvas.Height > 0)
+                g.DrawImage(_image, new Rectangle(0, 0, _canvas.Width, _canvas.Height));
+
+            float scale = _zoom.Value / 100f;
+            if (scale <= 0) scale = 1f;
+            using var font = new Font(FontFamily.GenericSansSerif, 9f, FontStyle.Bold);
+
+            for (int i = 0; i < _boxes.Count; i++)
+            {
+                var b = _boxes[i];
+                var r = new Rectangle(
+                    (int)(b.Bounds.X * scale),
+                    (int)(b.Bounds.Y * scale),
+                    Math.Max(1, (int)(b.Bounds.Width * scale)),
+                    Math.Max(1, (int)(b.Bounds.Height * scale)));
+
+                Color col = ColorForClass(b.ClassIndex);
+                using var pen = new Pen(col, i == _selected ? 3f : 2f);
+                g.DrawRectangle(pen, r);
+                using var brush = new SolidBrush(col);
+                string text = ClassNameFor(b.ClassIndex);
+                g.DrawString(text, font, brush, r.X + 2, r.Y + 2);
+            }
+
+            // In-progress rubber-band.
+            if (_drawing)
+            {
+                int x = Math.Min(_dragStartImg.X, _dragCurImg.X);
+                int y = Math.Min(_dragStartImg.Y, _dragCurImg.Y);
+                int w = Math.Abs(_dragCurImg.X - _dragStartImg.X);
+                int h = Math.Abs(_dragCurImg.Y - _dragStartImg.Y);
+                var r = new Rectangle((int)(x * scale), (int)(y * scale),
+                                      Math.Max(1, (int)(w * scale)), Math.Max(1, (int)(h * scale)));
+                using var pen = new Pen(Color.FromArgb(220, 255, 255, 255), 2f);
+                pen.DashStyle = System.Drawing.Drawing2D.DashStyle.Dash;
+                g.DrawRectangle(pen, r);
+            }
         }
-
-        // In-progress rubber-band.
-        if (_drawing)
+        catch (Exception ex)
         {
-            int x = Math.Min(_dragStartImg.X, _dragCurImg.X);
-            int y = Math.Min(_dragStartImg.Y, _dragCurImg.Y);
-            int w = Math.Abs(_dragCurImg.X - _dragStartImg.X);
-            int h = Math.Abs(_dragCurImg.Y - _dragStartImg.Y);
-            var r = new Rectangle((int)(x * scale), (int)(y * scale),
-                                  (int)(w * scale), (int)(h * scale));
-            using var pen = new Pen(Color.FromArgb(220, 255, 255, 255), 2f);
-            pen.DashStyle = System.Drawing.Drawing2D.DashStyle.Dash;
-            g.DrawRectangle(pen, r);
+            System.Diagnostics.Debug.WriteLine($"LabelEditor paint error: {ex.Message}");
         }
     }
 
@@ -291,97 +310,121 @@ public sealed class LabelEditor : Form
     // -----------------------------------------------------------------------
     private void OnCanvasMouseDown(object? sender, MouseEventArgs e)
     {
-        _canvas.Focus();
-
-        if (e.Button == MouseButtons.Middle || e.Button == MouseButtons.Right)
+        try
         {
-            _panning = true;
-            _panStartCursor = Cursor.Position;
-            _panStartScroll = new Point(-_scroll.AutoScrollPosition.X, -_scroll.AutoScrollPosition.Y);
-            _canvas.Cursor = Cursors.SizeAll;
-            return;
-        }
-        if (e.Button != MouseButtons.Left) return;
+            _canvas.Focus();
 
-        var imgPt = CanvasToImage(e.Location);
-
-        // Hit-test existing boxes: pick the SMALLEST that contains the point.
-        // (Small boxes are usually the ones the user actually wants.)
-        int hit = -1;
-        long bestArea = long.MaxValue;
-        for (int i = 0; i < _boxes.Count; i++)
-        {
-            if (_boxes[i].Bounds.Contains(imgPt))
+            if (e.Button == MouseButtons.Middle || e.Button == MouseButtons.Right)
             {
-                long a = (long)_boxes[i].Bounds.Width * _boxes[i].Bounds.Height;
-                if (a < bestArea) { bestArea = a; hit = i; }
+                _panning = true;
+                _panStartCursor = Cursor.Position;
+                _panStartScroll = new Point(-_scroll.AutoScrollPosition.X, -_scroll.AutoScrollPosition.Y);
+                _canvas.Cursor = Cursors.SizeAll;
+                return;
             }
-        }
-        if (hit >= 0)
-        {
-            _selected = hit;
-            _classCombo.SelectedIndex = _boxes[hit].ClassIndex;
-            _canvas.Invalidate();
-            UpdateStatus();
-            return;
-        }
+            if (e.Button != MouseButtons.Left) return;
 
-        // Otherwise start drawing a new box.
-        _drawing = true;
-        _dragStartImg = imgPt;
-        _dragCurImg = imgPt;
-        _selected = -1;
-        _canvas.Invalidate();
+            var imgPt = CanvasToImage(e.Location);
+
+            // Hit-test existing boxes: pick the SMALLEST that contains the point.
+            // (Small boxes are usually the ones the user actually wants.)
+            int hit = -1;
+            long bestArea = long.MaxValue;
+            for (int i = 0; i < _boxes.Count; i++)
+            {
+                if (_boxes[i].Bounds.Contains(imgPt))
+                {
+                    long a = (long)_boxes[i].Bounds.Width * _boxes[i].Bounds.Height;
+                    if (a < bestArea) { bestArea = a; hit = i; }
+                }
+            }
+            if (hit >= 0)
+            {
+                _selected = hit;
+                _boxClickedNotDrawn = true;  // user clicked existing box, allow class changes
+                _classCombo.SelectedIndex = _boxes[hit].ClassIndex;
+                _canvas.Invalidate();
+                UpdateStatus();
+                return;
+            }
+
+            // Otherwise start drawing a new box.
+            _drawing = true;
+            _dragStartImg = imgPt;
+            _dragCurImg = imgPt;
+            _selected = -1;
+            _boxClickedNotDrawn = false;  // will be drawing, not clicking
+            _canvas.Invalidate();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"MouseDown error: {ex}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 
     private void OnCanvasMouseMove(object? sender, MouseEventArgs e)
     {
-        if (_panning)
+        try
         {
-            Point cur = Cursor.Position;
-            int dx = cur.X - _panStartCursor.X;
-            int dy = cur.Y - _panStartCursor.Y;
-            int nx = Math.Max(0, _panStartScroll.X - dx);
-            int ny = Math.Max(0, _panStartScroll.Y - dy);
-            _scroll.AutoScrollPosition = new Point(nx, ny);
-            return;
+            if (_panning)
+            {
+                Point cur = Cursor.Position;
+                int dx = cur.X - _panStartCursor.X;
+                int dy = cur.Y - _panStartCursor.Y;
+                int nx = Math.Max(0, _panStartScroll.X - dx);
+                int ny = Math.Max(0, _panStartScroll.Y - dy);
+                _scroll.AutoScrollPosition = new Point(nx, ny);
+                return;
+            }
+            if (_drawing)
+            {
+                _dragCurImg = CanvasToImage(e.Location);
+                _canvas.Invalidate();
+            }
         }
-        if (_drawing)
+        catch (Exception ex)
         {
-            _dragCurImg = CanvasToImage(e.Location);
-            _canvas.Invalidate();
+            System.Diagnostics.Debug.WriteLine($"MouseMove error: {ex.Message}");
         }
     }
 
     private void OnCanvasMouseUp(object? sender, MouseEventArgs e)
     {
-        if (_panning && (e.Button == MouseButtons.Middle || e.Button == MouseButtons.Right))
+        try
         {
-            _panning = false;
-            _canvas.Cursor = Cursors.Cross;
-            return;
+            if (_panning && (e.Button == MouseButtons.Middle || e.Button == MouseButtons.Right))
+            {
+                _panning = false;
+                _canvas.Cursor = Cursors.Cross;
+                return;
+            }
+            if (!_drawing || e.Button != MouseButtons.Left) return;
+            _drawing = false;
+
+            int x = Math.Min(_dragStartImg.X, _dragCurImg.X);
+            int y = Math.Min(_dragStartImg.Y, _dragCurImg.Y);
+            int w = Math.Abs(_dragCurImg.X - _dragStartImg.X);
+            int h = Math.Abs(_dragCurImg.Y - _dragStartImg.Y);
+            // Ignore accidental tiny boxes.
+            if (w < 4 || h < 4) { _canvas.Invalidate(); return; }
+
+            // Clamp inside image.
+            x = Math.Max(0, x);
+            y = Math.Max(0, y);
+            if (x + w > _image.Width) w = _image.Width - x;
+            if (y + h > _image.Height) h = _image.Height - y;
+
+            var box = new LabelBox(new Rectangle(x, y, w, h), _classCombo.SelectedIndex);
+            _boxes.Add(box);
+            _selected = _boxes.Count - 1;
+            _boxClickedNotDrawn = false;  // just drew a box, don't let combo changes affect it
+            _canvas.Invalidate();
+            UpdateStatus();
         }
-        if (!_drawing || e.Button != MouseButtons.Left) return;
-        _drawing = false;
-
-        int x = Math.Min(_dragStartImg.X, _dragCurImg.X);
-        int y = Math.Min(_dragStartImg.Y, _dragCurImg.Y);
-        int w = Math.Abs(_dragCurImg.X - _dragStartImg.X);
-        int h = Math.Abs(_dragCurImg.Y - _dragStartImg.Y);
-        // Ignore accidental tiny boxes.
-        if (w < 4 || h < 4) { _canvas.Invalidate(); return; }
-
-        // Clamp inside image.
-        x = Math.Max(0, x);
-        y = Math.Max(0, y);
-        if (x + w > _image.Width) w = _image.Width - x;
-        if (y + h > _image.Height) h = _image.Height - y;
-
-        var box = new LabelBox(new Rectangle(x, y, w, h), _classCombo.SelectedIndex);
-        _boxes.Add(box);
-        _selected = _boxes.Count - 1;
-        _canvas.Invalidate();
-        UpdateStatus();
+        catch (Exception ex)
+        {
+            MessageBox.Show($"MouseUp error: {ex}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 
     private void OnWheelZoom(object? sender, MouseEventArgs e)
@@ -419,7 +462,10 @@ public sealed class LabelEditor : Form
     private Point CanvasToImage(Point canvasPt)
     {
         float scale = _zoom.Value / 100f;
-        return new Point((int)(canvasPt.X / scale), (int)(canvasPt.Y / scale));
+        if (scale <= 0) scale = 1f;
+        int x = Math.Clamp((int)(canvasPt.X / scale), 0, _image.Width - 1);
+        int y = Math.Clamp((int)(canvasPt.Y / scale), 0, _image.Height - 1);
+        return new Point(x, y);
     }
 
     private void ResizeCanvasToZoom()
@@ -465,18 +511,38 @@ public sealed class LabelEditor : Form
             File.WriteAllLines(Path.Combine(datasetDir, "classes.txt"),
                                DefaultClasses, new UTF8Encoding(false));
 
-            // Pick a unique stem so multiple labelling passes on the same image
-            // don't clobber each other.
+            // Check if base image already exists in dataset
             string stem = _stem;
             string imgPath = Path.Combine(imgDir, stem + ".png");
             string lblPath = Path.Combine(lblDir, stem + ".txt");
-            int suffix = 1;
-            while (File.Exists(imgPath) || File.Exists(lblPath))
+
+            if (File.Exists(imgPath) || File.Exists(lblPath))
             {
-                stem = _stem + "_" + suffix;
-                imgPath = Path.Combine(imgDir, stem + ".png");
-                lblPath = Path.Combine(lblDir, stem + ".txt");
-                suffix++;
+                var result = MessageBox.Show(this,
+                    $"Image '{stem}' already exists in dataset.\n\n" +
+                    "• Yes = Overwrite existing\n" +
+                    "• No = Save as new copy\n" +
+                    "• Cancel = Don't save",
+                    "Image Already Exists",
+                    MessageBoxButtons.YesNoCancel,
+                    MessageBoxIcon.Question);
+
+                if (result == DialogResult.Cancel)
+                    return;
+
+                if (result == DialogResult.No)
+                {
+                    // Find unique name
+                    int suffix = 1;
+                    while (File.Exists(imgPath) || File.Exists(lblPath))
+                    {
+                        stem = _stem + "_" + suffix;
+                        imgPath = Path.Combine(imgDir, stem + ".png");
+                        lblPath = Path.Combine(lblDir, stem + ".txt");
+                        suffix++;
+                    }
+                }
+                // If Yes, we overwrite with the original stem/paths
             }
 
             // Save the EXACT bitmap the user labelled — not the original on disk,
@@ -510,6 +576,189 @@ public sealed class LabelEditor : Form
         }
     }
 
+    /// <summary>Clear the entire training dataset (all images and labels).</summary>
+    private void ClearDataset()
+    {
+        try
+        {
+            string projectRoot = FindProjectRoot();
+            string datasetDir = Path.Combine(projectRoot, "dataset");
+
+            // Also check BoardviewBuilder/dataset location
+            string altDatasetDir = Path.Combine(projectRoot, "BoardviewBuilder", "dataset");
+            if (Directory.Exists(altDatasetDir))
+                datasetDir = altDatasetDir;
+
+            if (!Directory.Exists(datasetDir))
+            {
+                MessageBox.Show(this, "No dataset folder found.", "Clear Dataset",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            string imagesDir = Path.Combine(datasetDir, "images");
+            string labelsDir = Path.Combine(datasetDir, "labels");
+
+            int imageCount = Directory.Exists(imagesDir) ? Directory.GetFiles(imagesDir).Length : 0;
+            int labelCount = Directory.Exists(labelsDir) ? Directory.GetFiles(labelsDir).Length : 0;
+
+            if (imageCount == 0 && labelCount == 0)
+            {
+                MessageBox.Show(this, "Dataset is already empty.", "Clear Dataset",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            var result = MessageBox.Show(this,
+                $"This will permanently delete:\n\n" +
+                $"  • {imageCount} image(s)\n" +
+                $"  • {labelCount} label file(s)\n\n" +
+                $"from:\n{datasetDir}\n\n" +
+                $"Are you sure? This cannot be undone!",
+                "Clear Training Dataset",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning);
+
+            if (result != DialogResult.Yes)
+                return;
+
+            // Delete all files in images/ and labels/
+            if (Directory.Exists(imagesDir))
+            {
+                foreach (var file in Directory.GetFiles(imagesDir))
+                    File.Delete(file);
+            }
+            if (Directory.Exists(labelsDir))
+            {
+                foreach (var file in Directory.GetFiles(labelsDir))
+                    File.Delete(file);
+            }
+
+            _statusLabel.ForeColor = Color.DarkGreen;
+            _statusLabel.Text = $"Dataset cleared: deleted {imageCount} images and {labelCount} labels.";
+        }
+        catch (Exception ex)
+        {
+            _statusLabel.ForeColor = Color.Firebrick;
+            _statusLabel.Text = "Clear failed: " + ex.Message;
+        }
+    }
+
+    /// <summary>Launch the Python YOLO training script in a PowerShell window.</summary>
+    private void TrainModel()
+    {
+        try
+        {
+            // Find the train_yolo.py script
+            string? scriptPath = FindTrainScript();
+            if (scriptPath == null)
+            {
+                MessageBox.Show(this,
+                    "Could not find tools/train_yolo.py\n\n" +
+                    "Make sure you're running from the repository.",
+                    "Train Model",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
+
+            // Check if dataset exists and has files
+            string projectRoot = FindProjectRoot();
+            string datasetDir = Path.Combine(projectRoot, "dataset");
+            string altDatasetDir = Path.Combine(projectRoot, "BoardviewBuilder", "dataset");
+            if (Directory.Exists(altDatasetDir))
+                datasetDir = altDatasetDir;
+
+            string imagesDir = Path.Combine(datasetDir, "images");
+            int imageCount = Directory.Exists(imagesDir) ? Directory.GetFiles(imagesDir).Length : 0;
+
+            if (imageCount < 2)
+            {
+                MessageBox.Show(this,
+                    $"Need at least 2 labelled images to train.\n\n" +
+                    $"Currently have: {imageCount}\n\n" +
+                    $"Label more images and save them first.",
+                    "Train Model",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
+
+            var result = MessageBox.Show(this,
+                $"Start YOLO training with {imageCount} images?\n\n" +
+                $"This will open a PowerShell window and may take several minutes.\n\n" +
+                $"Script: {scriptPath}",
+                "Train Model",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question);
+
+            if (result != DialogResult.Yes)
+                return;
+
+            // Get the tools directory where the script lives
+            string toolsDir = Path.GetDirectoryName(scriptPath)!;
+
+            // Launch PowerShell with the training script
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "powershell.exe",
+                Arguments = $"-NoExit -Command \"cd '{toolsDir}'; python train_yolo.py\"",
+                UseShellExecute = true,
+                WorkingDirectory = toolsDir,
+            };
+
+            System.Diagnostics.Process.Start(psi);
+
+            _statusLabel.ForeColor = Color.DarkBlue;
+            _statusLabel.Text = "Training started in PowerShell window. Check that window for progress.";
+        }
+        catch (Exception ex)
+        {
+            _statusLabel.ForeColor = Color.Firebrick;
+            _statusLabel.Text = "Train failed: " + ex.Message;
+        }
+    }
+
+    /// <summary>Find the train_yolo.py script by searching common locations.</summary>
+    private static string? FindTrainScript()
+    {
+        string scriptName = "train_yolo.py";
+        string toolsPath = Path.Combine("tools", scriptName);
+
+        // 1. Relative to current working directory
+        string path1 = Path.Combine(Directory.GetCurrentDirectory(), toolsPath);
+        if (File.Exists(path1)) return path1;
+
+        // 2. Relative to executable
+        string path2 = Path.Combine(AppContext.BaseDirectory, toolsPath);
+        if (File.Exists(path2)) return path2;
+
+        // 3. Walk up to find the repo root (contains tools/ folder)
+        var dir = new DirectoryInfo(Directory.GetCurrentDirectory());
+        while (dir != null)
+        {
+            string path3 = Path.Combine(dir.FullName, toolsPath);
+            if (File.Exists(path3)) return path3;
+
+            // Check parent of BoardviewBuilder
+            string path4 = Path.Combine(dir.FullName, "BoardviewBuilder", "..", toolsPath);
+            if (File.Exists(path4)) return Path.GetFullPath(path4);
+
+            dir = dir.Parent;
+        }
+
+        // 4. Walk up from exe location
+        dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir != null)
+        {
+            string path5 = Path.Combine(dir.FullName, toolsPath);
+            if (File.Exists(path5)) return path5;
+            dir = dir.Parent;
+        }
+
+        return null;
+    }
+
     /// <summary>Walks up the directory tree from the current working directory
     /// until it finds a folder containing a `.csproj` or `.sln`; that's the
     /// project root. If nothing matches we fall back to cwd.</summary>
@@ -527,5 +776,20 @@ public sealed class LabelEditor : Form
             dir = dir.Parent;
         }
         return Directory.GetCurrentDirectory();
+    }
+}
+
+/// <summary>
+/// PictureBox with double-buffering enabled to prevent flicker during repaints.
+/// </summary>
+internal sealed class DoubleBufferedPictureBox : PictureBox
+{
+    public DoubleBufferedPictureBox()
+    {
+        DoubleBuffered = true;
+        SetStyle(ControlStyles.AllPaintingInWmPaint |
+                 ControlStyles.UserPaint |
+                 ControlStyles.OptimizedDoubleBuffer, true);
+        UpdateStyles();
     }
 }

@@ -30,6 +30,9 @@ public sealed class SymbolDetectorYolo : IDisposable
     private readonly string _inputName;
     private bool _disposed;
 
+    /// <summary>Debug info from last detection run.</summary>
+    public string LastDebugInfo { get; private set; } = "";
+
     private SymbolDetectorYolo(InferenceSession session, string[] classNames, string inputName)
     {
         _session = session;
@@ -43,16 +46,18 @@ public sealed class SymbolDetectorYolo : IDisposable
     /// </summary>
     public static SymbolDetectorYolo? TryLoad(string modelPath, string classesPath)
     {
-        // Resolve paths relative to the executable
-        string basePath = AppContext.BaseDirectory;
-        string fullModelPath = Path.IsPathRooted(modelPath) ? modelPath : Path.Combine(basePath, modelPath);
-        string fullClassesPath = Path.IsPathRooted(classesPath) ? classesPath : Path.Combine(basePath, classesPath);
+        // Try multiple locations for the model:
+        // 1. Relative to executable (bin/Debug/.../models/)
+        // 2. Relative to current working directory (for dotnet run)
+        // 3. Walk up to find BoardviewBuilder/models/ (source tree)
+        string? fullModelPath = FindFile(modelPath);
+        string? fullClassesPath = FindFile(classesPath);
 
-        if (!File.Exists(fullModelPath))
+        if (fullModelPath == null || !File.Exists(fullModelPath))
             return null;
 
         string[] classNames;
-        if (File.Exists(fullClassesPath))
+        if (fullClassesPath != null && File.Exists(fullClassesPath))
         {
             classNames = File.ReadAllLines(fullClassesPath)
                 .Where(l => !string.IsNullOrWhiteSpace(l))
@@ -102,11 +107,22 @@ public sealed class SymbolDetectorYolo : IDisposable
         using var results = _session.Run(inputs);
         var output = results.First().AsTensor<float>();
 
+        // Debug: log output shape and max values
+        var dims = output.Dimensions.ToArray();
+        float maxScore = 0f;
+        int numClasses = dims[1] - 4;
+        int numAnchors = dims[2];
+        for (int i = 0; i < numAnchors; i++)
+            for (int c = 0; c < numClasses; c++)
+                maxScore = Math.Max(maxScore, output[0, 4 + c, i]);
+
         // Postprocess: decode YOLOv8 output, threshold, NMS
         var detections = Postprocess(output, image.Width, image.Height, scale, padX, padY, confThreshold);
 
         // Class-wise NMS
         var finalDetections = ApplyNMS(detections, iouThreshold);
+
+        LastDebugInfo = $"shape=[{string.Join(",", dims)}], maxConf={maxScore:F4}, thresh={confThreshold:F4}, preNMS={detections.Count}, postNMS={finalDetections.Count}";
 
         return finalDetections;
     }
@@ -298,5 +314,56 @@ public sealed class SymbolDetectorYolo : IDisposable
             _session.Dispose();
             _disposed = true;
         }
+    }
+
+    /// <summary>
+    /// Find a file by checking multiple locations:
+    /// 1. Relative to executable (AppContext.BaseDirectory)
+    /// 2. Relative to current working directory
+    /// 3. Walk up directory tree to find BoardviewBuilder/models/
+    /// </summary>
+    private static string? FindFile(string relativePath)
+    {
+        System.Diagnostics.Debug.WriteLine($"[YOLO] Looking for: {relativePath}");
+        System.Diagnostics.Debug.WriteLine($"[YOLO] AppContext.BaseDirectory: {AppContext.BaseDirectory}");
+        System.Diagnostics.Debug.WriteLine($"[YOLO] CurrentDirectory: {Directory.GetCurrentDirectory()}");
+
+        // 1. Relative to executable
+        string path1 = Path.Combine(AppContext.BaseDirectory, relativePath);
+        System.Diagnostics.Debug.WriteLine($"[YOLO] Checking: {path1} -> {File.Exists(path1)}");
+        if (File.Exists(path1))
+            return path1;
+
+        // 2. Relative to current working directory
+        string path2 = Path.Combine(Directory.GetCurrentDirectory(), relativePath);
+        System.Diagnostics.Debug.WriteLine($"[YOLO] Checking: {path2} -> {File.Exists(path2)}");
+        if (File.Exists(path2))
+            return path2;
+
+        // 3. Walk up to find BoardviewBuilder folder (handles running from bin/)
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir != null)
+        {
+            // Check if this is the BoardviewBuilder project folder
+            string path3 = Path.Combine(dir.FullName, relativePath);
+            if (File.Exists(path3))
+            {
+                System.Diagnostics.Debug.WriteLine($"[YOLO] Found at: {path3}");
+                return path3;
+            }
+
+            // Check if there's a BoardviewBuilder subfolder
+            string path4 = Path.Combine(dir.FullName, "BoardviewBuilder", relativePath);
+            if (File.Exists(path4))
+            {
+                System.Diagnostics.Debug.WriteLine($"[YOLO] Found at: {path4}");
+                return path4;
+            }
+
+            dir = dir.Parent;
+        }
+
+        System.Diagnostics.Debug.WriteLine($"[YOLO] Not found: {relativePath}");
+        return null;
     }
 }

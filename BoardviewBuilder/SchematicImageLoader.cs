@@ -1,9 +1,11 @@
 using System.Drawing.Imaging;
+using PDFtoImage;
+using SkiaSharp;
 
 namespace BoardviewBuilder;
 
 /// <summary>
-/// Loads a raster schematic (JPEG / PNG / BMP) and produces a <see cref="Netlist"/>.
+/// Loads a raster schematic (JPEG / PNG / BMP / PDF) and produces a <see cref="Netlist"/>.
 ///
 /// STATUS:
 ///   * <see cref="Load"/>              — loads the image, captures metadata, returns an empty Netlist.
@@ -18,7 +20,7 @@ public static class SchematicImageLoader
 {
     /// <summary>Supported file extensions for the open-file dialog.</summary>
     public static readonly string[] SupportedExtensions =
-        { ".jpg", ".jpeg", ".png", ".bmp" };
+        { ".jpg", ".jpeg", ".png", ".bmp", ".pdf" };
 
     public sealed class LoadResult : IDisposable
     {
@@ -34,19 +36,40 @@ public static class SchematicImageLoader
     /// metadata notes). Call <see cref="ExtractFromBitmap"/> on the processed
     /// image to actually populate the netlist.
     /// </summary>
-    public static LoadResult Load(string path)
+    public static LoadResult Load(string path) => Load(path, pageIndex: 0);
+
+    /// <summary>
+    /// Load the image file with optional page index for multi-page PDFs.
+    /// </summary>
+    public static LoadResult Load(string path, int pageIndex)
     {
         if (!File.Exists(path))
             throw new FileNotFoundException($"Schematic image not found: {path}");
 
-        // Bitmap(string) keeps a file lock for the lifetime of the bitmap.
-        // Load via a memory copy so the source file stays free.
-        Bitmap bmp;
+        string ext = Path.GetExtension(path).ToLowerInvariant();
         byte[] bytes = File.ReadAllBytes(path);
-        using (var ms = new MemoryStream(bytes, writable: false))
-        using (var src = new Bitmap(ms))
+
+        Bitmap bmp;
+        string formatNote;
+        int totalPages = 1;
+
+        if (ext == ".pdf")
         {
+            // Load PDF and render the specified page
+            (bmp, totalPages) = LoadPdfPage(bytes, pageIndex);
+            formatNote = totalPages > 1
+                ? $"PDF page {pageIndex + 1} of {totalPages}"
+                : "PDF (single page)";
+        }
+        else
+        {
+            // Load regular image
+            // Bitmap(string) keeps a file lock for the lifetime of the bitmap.
+            // Load via a memory copy so the source file stays free.
+            using var ms = new MemoryStream(bytes, writable: false);
+            using var src = new Bitmap(ms);
             bmp = new Bitmap(src);
+            formatNote = PixelFormatName(bmp.PixelFormat);
         }
 
         var netlist = new Netlist
@@ -57,7 +80,7 @@ public static class SchematicImageLoader
         netlist.Notes.Add($"File: {Path.GetFileName(path)} ({bytes.Length:N0} bytes)");
         netlist.Notes.Add($"Image: {bmp.Width} × {bmp.Height} px, " +
                           $"{bmp.HorizontalResolution:F0}×{bmp.VerticalResolution:F0} DPI, " +
-                          $"{PixelFormatName(bmp.PixelFormat)}");
+                          $"{formatNote}");
         netlist.Notes.Add("Click \"Extract from image\" to run OCR.");
 
         return new LoadResult
@@ -66,6 +89,54 @@ public static class SchematicImageLoader
             Netlist = netlist,
             SourcePath = path,
         };
+    }
+
+    /// <summary>Get the number of pages in a PDF file.</summary>
+    public static int GetPdfPageCount(string path)
+    {
+        if (!File.Exists(path)) return 0;
+        try
+        {
+            byte[] bytes = File.ReadAllBytes(path);
+            return Conversion.GetPageCount(bytes);
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    /// <summary>Load a specific page from a PDF as a bitmap.</summary>
+    private static (Bitmap bmp, int totalPages) LoadPdfPage(byte[] pdfBytes, int pageIndex)
+    {
+        int totalPages = Conversion.GetPageCount(pdfBytes);
+        if (pageIndex < 0 || pageIndex >= totalPages)
+            pageIndex = 0;
+
+        // Render at 200 DPI for good OCR quality
+        const int dpi = 200;
+
+        // Get page size using Index (new API)
+        var pageSize = Conversion.GetPageSize(pdfBytes, new Index(pageIndex));
+        int width = (int)(pageSize.Width * dpi / 72.0);  // PDF uses 72 points per inch
+        int height = (int)(pageSize.Height * dpi / 72.0);
+
+        // PDFtoImage ToImage - use RenderOptions for size
+        var options = new RenderOptions(Dpi: dpi);
+
+        // PDFtoImage returns SKBitmap, convert to System.Drawing.Bitmap
+        using SKBitmap skBitmap = Conversion.ToImage(pdfBytes, new Index(pageIndex), options: options);
+
+        // Convert SKBitmap to System.Drawing.Bitmap
+        using var skImage = SKImage.FromBitmap(skBitmap);
+        using var skData = skImage.Encode(SKEncodedImageFormat.Png, 100);
+        using var ms = new MemoryStream(skData.ToArray());
+        var bmp = new Bitmap(ms);
+
+        // Set DPI metadata
+        bmp.SetResolution(dpi, dpi);
+
+        return (bmp, totalPages);
     }
 
     /// <summary>Result of one extraction pass — useful for the status bar.</summary>
@@ -90,6 +161,12 @@ public static class SchematicImageLoader
         /// CC near the text). Missing key = no symbol found. Used by the UI to
         /// draw a blue rectangle around each detected component symbol.</summary>
         public required IReadOnlyDictionary<string, Rectangle> SymbolBoxes { get; init; }
+        /// <summary>Raw YOLO detections for debug overlay (magenta boxes).</summary>
+        public required IReadOnlyList<SymbolDetector.SymbolHit> YoloHits { get; init; }
+        /// <summary>Detected pins where wires connect to symbol edges.</summary>
+        public required IReadOnlyList<WireTracer.DetectedPin> Pins { get; init; }
+        /// <summary>Wire segments with their bounding boxes.</summary>
+        public required IReadOnlyList<WireTracer.WireSegment> Wires { get; init; }
     }
 
     /// <summary>
@@ -211,15 +288,20 @@ public static class SchematicImageLoader
                                   || n.StartsWith("Click \"Extract", StringComparison.Ordinal));
         netlist.Notes.Add($"OCR: recognised {words.Count} word(s).");
         netlist.Notes.Add($"OCR: {refs.Count} reference designator(s), {nets.Count} net label(s).");
+        string yoloStatus = traceStats.YoloLoaded
+            ? $"YOLO: {traceStats.YoloRawDetections} raw detections"
+            : "YOLO: not loaded";
         string symbolNote = traceStats.SymbolsViaYolo > 0
             ? $"{traceStats.SymbolsFound} symbol(s) located ({traceStats.SymbolsViaYolo} YOLO, {traceStats.SymbolsViaGeometric} geometric)"
-            : $"{traceStats.SymbolsFound} symbol(s) located";
+            : $"{traceStats.SymbolsFound} symbol(s) located ({yoloStatus})";
         netlist.Notes.Add($"Trace: {traceStats.ConnectedComponents} CC(s), " +
                           $"{symbolNote}, " +
                           $"{traceStats.Nets} traced group(s) → {membersByName.Count} named net(s), " +
                           $"{traceStats.IsolatedTextBoxes} isolated text box(es), " +
                           $"{connections} pin↔net connection(s), " +
                           $"trace took {traceStats.ElapsedMs} ms.");
+        if (!string.IsNullOrEmpty(traceStats.YoloDebugInfo))
+            netlist.Notes.Add($"YOLO debug: {traceStats.YoloDebugInfo}");
         if (words.Count > 0)
         {
             var lowConf = words.OrderBy(w => w.Confidence).Take(10).ToList();
@@ -239,6 +321,9 @@ public static class SchematicImageLoader
             Designators = refs,
             NetLabels = nets,
             SymbolBoxes = traceResult.SymbolBoxes,
+            YoloHits = traceResult.YoloHits,
+            Pins = traceResult.Pins,
+            Wires = traceResult.Wires,
         };
     }
 
