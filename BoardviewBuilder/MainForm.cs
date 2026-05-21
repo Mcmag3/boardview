@@ -62,6 +62,12 @@ public sealed class MainForm : Form
     // Null until the user clicks "Extract from image" at least once.
     private SchematicImageLoader.ExtractionResult? _lastOcr;
 
+    // Multi-step extraction state
+    private SchematicImageLoader.Phase1ExtractionResult? _phase1Result;
+    private SchematicImageLoader.Phase2ExtractionResult? _phase2Result;
+    private List<Rectangle> _manualSymbolBoxes = new();
+    private List<WireTracer.DetectedPin> _manualPins = new();
+
     // Pan/zoom state
     private bool _panning;
     private Point _panStartCursor;
@@ -409,24 +415,40 @@ public sealed class MainForm : Form
         var applyEditsBtn = new Button { Text = "Apply edits",      AutoSize = true, Margin = new Padding(3) };
         var loadNetBtn    = new Button { Text = "Load netlist…",    AutoSize = true, Margin = new Padding(3) };
         var saveNetBtn    = new Button { Text = "Save netlist…",    AutoSize = true, Margin = new Padding(3) };
-        var extractBtn    = new Button { Text = "Extract from image", AutoSize = true, Margin = new Padding(3), Enabled = false };
-        var labelBtn      = new Button { Text = "Label for training…", AutoSize = true, Margin = new Padding(3) };
+        // Multi-step extraction buttons
+        var step1Btn      = new Button { Text = "1: OCR+Symbols", AutoSize = true, Margin = new Padding(3), Enabled = false };
+        var step2Btn      = new Button { Text = "2: Detect Pins", AutoSize = true, Margin = new Padding(3), Enabled = false };
+        var step3Btn      = new Button { Text = "3: Trace Wires", AutoSize = true, Margin = new Padding(3), Enabled = false };
+        var extractBtn    = new Button { Text = "Extract (all)", AutoSize = true, Margin = new Padding(3), Enabled = false };
+        var labelBtn      = new Button { Text = "Label…", AutoSize = true, Margin = new Padding(3) };
         bottom.Controls.Add(applyEditsBtn, 1, 0);
         bottom.Controls.Add(loadNetBtn,    2, 0);
         bottom.Controls.Add(saveNetBtn,    3, 0);
-        bottom.Controls.Add(extractBtn,    4, 0);
-        // Reserve one more column for the label button.
-        bottom.ColumnCount = 6;
+        bottom.Controls.Add(step1Btn,      4, 0);
+        bottom.Controls.Add(step2Btn,      5, 0);
+        bottom.Controls.Add(step3Btn,      6, 0);
+        bottom.Controls.Add(extractBtn,    7, 0);
+        bottom.ColumnCount = 9;
         bottom.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        bottom.Controls.Add(labelBtn, 5, 0);
+        bottom.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        bottom.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        bottom.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        bottom.Controls.Add(labelBtn, 8, 0);
         labelBtn.Click += (_, _) => OpenLabelEditor(status);
+
+        // Step 1: OCR + Symbol detection
+        step1Btn.Click += (_, _) => RunStep1(netlistText, status, step2Btn);
+        // Step 2: Pin detection
+        step2Btn.Click += (_, _) => RunStep2(netlistText, status, step3Btn);
+        // Step 3: Wire tracing
+        step3Btn.Click += (_, _) => RunStep3(netlistText, status);
 
 
         root.Controls.Add(bottom, 0, 3);
 
         // ---- Wire up events ------------------------------------------------
         browseBtn.Click += (_, _) => BrowseSchematic(pathBox);
-        loadBtn.Click   += (_, _) => LoadSchematic(pathBox, img, zoom, zoomLabel, netlistText, status, extractBtn);
+        loadBtn.Click   += (_, _) => LoadSchematic(pathBox, img, zoom, zoomLabel, netlistText, status, extractBtn, step1Btn, step2Btn, step3Btn);
 
         zoom.ValueChanged += (_, _) =>
         {
@@ -519,7 +541,8 @@ public sealed class MainForm : Form
     }
 
     private void LoadSchematic(TextBox pathBox, PictureBox img, TrackBar zoom, Label zoomLabel,
-                               TextBox netlistText, Label status, Button extractBtn)
+                               TextBox netlistText, Label status,
+                               Button extractBtn, Button step1Btn, Button step2Btn, Button step3Btn)
     {
         try
         {
@@ -535,6 +558,12 @@ public sealed class MainForm : Form
             _displayBitmap = null;
             _schematic?.Dispose();
             _schematic = null;
+
+            // Reset multi-step state
+            _phase1Result = null;
+            _phase2Result = null;
+            _manualSymbolBoxes.Clear();
+            _manualPins.Clear();
 
             // Check if PDF with multiple pages
             int pageIndex = 0;
@@ -559,11 +588,14 @@ public sealed class MainForm : Form
             netlistText.Text = NetlistTextFormat.Format(_schematic.Netlist)
                                                 .Replace("\n", Environment.NewLine);
             extractBtn.Enabled = true;
+            step1Btn.Enabled = true;
+            step2Btn.Enabled = false;
+            step3Btn.Enabled = false;
 
             SchemOk(status,
                 $"Loaded {Path.GetFileName(path)} — " +
                 $"{_schematic.Image.Width}×{_schematic.Image.Height} px. " +
-                "Adjust the image, edit the netlist, then Apply edits.");
+                "Click '1: OCR+Symbols' to start extraction.");
         }
         catch (Exception ex)
         {
@@ -573,6 +605,9 @@ public sealed class MainForm : Form
             _displayBitmap = null;
             img.Image = null;
             extractBtn.Enabled = false;
+            step1Btn.Enabled = false;
+            step2Btn.Enabled = false;
+            step3Btn.Enabled = false;
             netlistText.Text = "(load failed)";
             SchemWarn(status, ex.Message);
         }
@@ -1034,6 +1069,209 @@ public sealed class MainForm : Form
         {
             Cursor.Current = Cursors.Default;
         }
+    }
+
+    // ---- Multi-step extraction -----------------------------------------------
+
+    /// <summary>Step 1: Run OCR + YOLO detection, then open symbol box editor.</summary>
+    private void RunStep1(TextBox netlistText, Label status, Button step2Btn)
+    {
+        if (_schematic is null || _displayBitmap is null)
+        {
+            SchemWarn(status, "Load a schematic image first.");
+            return;
+        }
+
+        Cursor.Current = Cursors.WaitCursor;
+        try
+        {
+            // Run Phase 1
+            _phase1Result = SchematicImageLoader.ExtractPhase1(_displayBitmap);
+            _manualSymbolBoxes.Clear();
+
+            // Create a temporary ExtractionResult for overlay display
+            UpdateOverlayFromPhase1();
+            RefreshProcessedImage(_imageBox, _zoomBar);
+
+            SchemOk(status,
+                $"Step 1: {_phase1Result.AllWords.Count} words, " +
+                $"{_phase1Result.Designators.Count} designators, " +
+                $"{_phase1Result.TracePhase1.YoloHits.Count} YOLO detections. " +
+                $"Opening symbol box editor...");
+
+            // Open symbol box editor
+            using var editor = new SymbolBoxEditor(_displayBitmap, _phase1Result.TracePhase1.YoloHits);
+            if (editor.ShowDialog(this) == DialogResult.OK)
+            {
+                _manualSymbolBoxes = editor.ManualBoxes.ToList();
+                step2Btn.Enabled = true;
+                SchemOk(status,
+                    $"Step 1 complete: {_phase1Result.TracePhase1.YoloHits.Count} YOLO + " +
+                    $"{_manualSymbolBoxes.Count} manual symbol boxes. Click '2: Detect Pins'.");
+            }
+            else
+            {
+                SchemOk(status, "Symbol box editing cancelled.");
+            }
+
+            // Update overlay with any manual boxes
+            UpdateOverlayFromPhase1();
+            RefreshProcessedImage(_imageBox, _zoomBar);
+        }
+        catch (Exception ex)
+        {
+            SchemWarn(status, "Step 1 failed: " + ex.Message);
+        }
+        finally
+        {
+            Cursor.Current = Cursors.Default;
+        }
+    }
+
+    /// <summary>Step 2: Run pin detection, then open pin editor.</summary>
+    private void RunStep2(TextBox netlistText, Label status, Button step3Btn)
+    {
+        if (_phase1Result is null || _displayBitmap is null)
+        {
+            SchemWarn(status, "Run Step 1 first.");
+            return;
+        }
+
+        Cursor.Current = Cursors.WaitCursor;
+        try
+        {
+            // Run Phase 2
+            _phase2Result = SchematicImageLoader.ExtractPhase2(_phase1Result, _manualSymbolBoxes);
+            _manualPins.Clear();
+
+            // Update overlay to show detected pins
+            UpdateOverlayFromPhase2();
+            RefreshProcessedImage(_imageBox, _zoomBar);
+
+            SchemOk(status,
+                $"Step 2: {_phase2Result.TracePhase2.Pins.Count} pins detected. " +
+                $"Opening pin editor...");
+
+            // Open pin editor
+            using var editor = new PinEditor(
+                _displayBitmap,
+                _phase1Result.TracePhase1.YoloHits,
+                _manualSymbolBoxes,
+                _phase2Result.TracePhase2.Pins);
+            if (editor.ShowDialog(this) == DialogResult.OK)
+            {
+                _manualPins = editor.ManualPins.ToList();
+                step3Btn.Enabled = true;
+                SchemOk(status,
+                    $"Step 2 complete: {_phase2Result.TracePhase2.Pins.Count} detected + " +
+                    $"{_manualPins.Count} manual pins. Click '3: Trace Wires'.");
+            }
+            else
+            {
+                SchemOk(status, "Pin editing cancelled.");
+            }
+
+            // Update overlay with any manual pins
+            UpdateOverlayFromPhase2();
+            RefreshProcessedImage(_imageBox, _zoomBar);
+        }
+        catch (Exception ex)
+        {
+            SchemWarn(status, "Step 2 failed: " + ex.Message);
+        }
+        finally
+        {
+            Cursor.Current = Cursors.Default;
+        }
+    }
+
+    /// <summary>Step 3: Run wire tracing and build final netlist.</summary>
+    private void RunStep3(TextBox netlistText, Label status)
+    {
+        if (_phase2Result is null || _schematic is null)
+        {
+            SchemWarn(status, "Run Steps 1 and 2 first.");
+            return;
+        }
+
+        Cursor.Current = Cursors.WaitCursor;
+        try
+        {
+            // Run Phase 3
+            var result = SchematicImageLoader.ExtractPhase3(_phase2Result, _schematic.Netlist, _manualPins);
+            _lastOcr = result;
+
+            RefreshProcessedImage(_imageBox, _zoomBar);
+
+            netlistText.Text = NetlistTextFormat.Format(_schematic.Netlist)
+                                                .Replace("\n", Environment.NewLine);
+
+            var s = result.Stats;
+            SchemOk(status,
+                $"Step 3 complete: {s.TracedNets} nets, {s.Connections} connections. " +
+                $"Total time {s.ElapsedMs} ms.");
+        }
+        catch (Exception ex)
+        {
+            SchemWarn(status, "Step 3 failed: " + ex.Message);
+        }
+        finally
+        {
+            Cursor.Current = Cursors.Default;
+        }
+    }
+
+    /// <summary>Create an overlay ExtractionResult from Phase 1 for display.</summary>
+    private void UpdateOverlayFromPhase1()
+    {
+        if (_phase1Result is null) return;
+
+        // Create a minimal ExtractionResult just for the overlay
+        _lastOcr = new SchematicImageLoader.ExtractionResult
+        {
+            Stats = new SchematicImageLoader.ExtractionStats(
+                _phase1Result.AllWords.Count,
+                _phase1Result.Designators.Count,
+                _phase1Result.NetLabels.Count,
+                0, 0, _phase1Result.ElapsedMs),
+            AllWords = _phase1Result.AllWords,
+            Designators = _phase1Result.Designators,
+            NetLabels = _phase1Result.NetLabels,
+            SymbolBoxes = _phase1Result.TracePhase1.SymbolBoxes,
+            YoloHits = _phase1Result.TracePhase1.YoloHits,
+            Pins = Array.Empty<WireTracer.DetectedPin>(),
+            Wires = Array.Empty<WireTracer.WireSegment>(),
+            TracedWires = Array.Empty<WireTracer.TracedWire>(),
+            Junctions = Array.Empty<WireTracer.WireJunction>(),
+        };
+    }
+
+    /// <summary>Create an overlay ExtractionResult from Phase 2 for display.</summary>
+    private void UpdateOverlayFromPhase2()
+    {
+        if (_phase2Result is null) return;
+        var phase1 = _phase2Result.Phase1;
+
+        // Combine detected and manual pins
+        var allPins = _phase2Result.TracePhase2.Pins.Concat(_manualPins).ToList();
+
+        _lastOcr = new SchematicImageLoader.ExtractionResult
+        {
+            Stats = new SchematicImageLoader.ExtractionStats(
+                phase1.AllWords.Count,
+                phase1.Designators.Count,
+                phase1.NetLabels.Count,
+                0, 0, phase1.ElapsedMs + _phase2Result.ElapsedMs),
+            AllWords = phase1.AllWords,
+            Designators = phase1.Designators,
+            NetLabels = phase1.NetLabels,
+            SymbolBoxes = phase1.TracePhase1.SymbolBoxes,
+            YoloHits = phase1.TracePhase1.YoloHits,
+            Pins = allPins,
+            Wires = Array.Empty<WireTracer.WireSegment>(),
+            TracedWires = Array.Empty<WireTracer.TracedWire>(),
+            Junctions = Array.Empty<WireTracer.WireJunction>(),
+        };
     }
 
     /// <summary>Open the YOLO-format labelling editor on the currently

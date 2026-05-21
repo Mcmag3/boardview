@@ -173,6 +173,33 @@ public static class SchematicImageLoader
         public required IReadOnlyList<WireTracer.WireJunction> Junctions { get; init; }
     }
 
+    // -----------------------------------------------------------------------
+    //  Phase 1 Result: OCR + YOLO detection (for multi-step workflow)
+    // -----------------------------------------------------------------------
+    /// <summary>Result of Phase 1: OCR + YOLO detection.
+    /// Allows manual editing of symbol boxes before proceeding to pin detection.</summary>
+    public sealed class Phase1ExtractionResult
+    {
+        public required IReadOnlyList<OcrEngine.Word> AllWords { get; init; }
+        public required IReadOnlyDictionary<string, OcrEngine.Word> Designators { get; init; }
+        public required IReadOnlyDictionary<string, OcrEngine.Word> NetLabels { get; init; }
+        public required IReadOnlyList<WireTracer.TextBoxInfo> TextBoxes { get; init; }
+        public required WireTracer.Phase1Result TracePhase1 { get; init; }
+        public required long ElapsedMs { get; init; }
+    }
+
+    // -----------------------------------------------------------------------
+    //  Phase 2 Result: Pin detection (for multi-step workflow)
+    // -----------------------------------------------------------------------
+    /// <summary>Result of Phase 2: Pin detection.
+    /// Allows manual editing of pins before proceeding to wire tracing.</summary>
+    public sealed class Phase2ExtractionResult
+    {
+        public required Phase1ExtractionResult Phase1 { get; init; }
+        public required WireTracer.Phase2Result TracePhase2 { get; init; }
+        public required long ElapsedMs { get; init; }
+    }
+
     /// <summary>
     /// Run OCR over <paramref name="processed"/> (typically the user's
     /// adjusted/binarised image), classify the recognised words into
@@ -324,6 +351,203 @@ public static class SchematicImageLoader
             AllWords = words,
             Designators = refs,
             NetLabels = nets,
+            SymbolBoxes = traceResult.SymbolBoxes,
+            YoloHits = traceResult.YoloHits,
+            Pins = traceResult.Pins,
+            Wires = traceResult.Wires,
+            TracedWires = traceResult.TracedWires,
+            Junctions = traceResult.Junctions,
+        };
+    }
+
+    // -----------------------------------------------------------------------
+    //  PHASE 1: OCR + YOLO detection (multi-step workflow)
+    // -----------------------------------------------------------------------
+    /// <summary>Phase 1: Run OCR and YOLO detection.
+    /// Returns intermediate result for manual symbol box editing.</summary>
+    public static Phase1ExtractionResult ExtractPhase1(Bitmap processed)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var words = OcrEngine.RecognizeWords(processed);
+
+        // Classify OCR words into designators and net labels
+        var refs = new Dictionary<string, OcrEngine.Word>(StringComparer.Ordinal);
+        var nets = new Dictionary<string, OcrEngine.Word>(StringComparer.Ordinal);
+
+        foreach (var w in words)
+        {
+            string cleaned = w.Text.Trim().Trim(':', ',', '.', ';');
+            string upper = cleaned.ToUpperInvariant();
+
+            if (OcrEngine.ReferenceDesignatorRegex.IsMatch(upper))
+            {
+                if (!refs.ContainsKey(upper))
+                    refs[upper] = w with { Text = upper };
+            }
+            else if (OcrEngine.IsLikelyNetLabel(upper))
+            {
+                if (!nets.ContainsKey(upper))
+                    nets[upper] = w with { Text = upper };
+            }
+        }
+
+        // Build the input list for the wire tracer
+        var textBoxes = new List<WireTracer.TextBoxInfo>(refs.Count + nets.Count);
+        foreach (var kv in refs)
+            textBoxes.Add(new WireTracer.TextBoxInfo(
+                kv.Key, kv.Value.Bounds, WireTracer.TextKind.Designator));
+        foreach (var kv in nets)
+            textBoxes.Add(new WireTracer.TextBoxInfo(
+                kv.Key, kv.Value.Bounds, WireTracer.TextKind.NetLabel));
+
+        // Run Phase 1 of wire tracer
+        var tracePhase1 = WireTracer.TracePhase1(processed, textBoxes);
+
+        sw.Stop();
+        return new Phase1ExtractionResult
+        {
+            AllWords = words,
+            Designators = refs,
+            NetLabels = nets,
+            TextBoxes = textBoxes,
+            TracePhase1 = tracePhase1,
+            ElapsedMs = sw.ElapsedMilliseconds,
+        };
+    }
+
+    // -----------------------------------------------------------------------
+    //  PHASE 2: Pin detection (multi-step workflow)
+    // -----------------------------------------------------------------------
+    /// <summary>Phase 2: Run pin detection.
+    /// Takes Phase 1 result plus any manually added symbol boxes.
+    /// Returns intermediate result for manual pin editing.</summary>
+    public static Phase2ExtractionResult ExtractPhase2(
+        Phase1ExtractionResult phase1,
+        IReadOnlyList<Rectangle>? manualSymbolBoxes = null)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+
+        var tracePhase2 = WireTracer.TracePhase2(phase1.TracePhase1, manualSymbolBoxes);
+
+        sw.Stop();
+        return new Phase2ExtractionResult
+        {
+            Phase1 = phase1,
+            TracePhase2 = tracePhase2,
+            ElapsedMs = sw.ElapsedMilliseconds,
+        };
+    }
+
+    // -----------------------------------------------------------------------
+    //  PHASE 3: Wire tracing (multi-step workflow)
+    // -----------------------------------------------------------------------
+    /// <summary>Phase 3: Run wire tracing and build netlist.
+    /// Takes Phase 2 result plus any manually added pins.
+    /// Returns the final ExtractionResult.</summary>
+    public static ExtractionResult ExtractPhase3(
+        Phase2ExtractionResult phase2,
+        Netlist netlist,
+        IReadOnlyList<WireTracer.DetectedPin>? manualPins = null)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var phase1 = phase2.Phase1;
+
+        // Run Phase 3 of wire tracer
+        var traceResult = WireTracer.TracePhase3(phase2.TracePhase2, manualPins);
+        var tracedGroups = traceResult.Nets;
+
+        // Merge groups by name
+        var membersByName = new Dictionary<string, List<WireTracer.TextBoxInfo>>(StringComparer.Ordinal);
+        foreach (var grp in tracedGroups)
+        {
+            if (!membersByName.TryGetValue(grp.Name, out var list))
+            {
+                list = new List<WireTracer.TextBoxInfo>();
+                membersByName[grp.Name] = list;
+            }
+            list.AddRange(grp.Members);
+        }
+
+        // Build components, sorted by prefix+number
+        netlist.Components.Clear();
+        var componentByRef = new Dictionary<string, NetlistComponent>(StringComparer.Ordinal);
+
+        var orderedRefs = phase1.Designators.Values
+            .OrderBy(w => SplitPrefix(w.Text).prefix, StringComparer.Ordinal)
+            .ThenBy(w => SplitPrefix(w.Text).number)
+            .ToList();
+        foreach (var w in orderedRefs)
+        {
+            var c = new NetlistComponent { Reference = w.Text };
+            componentByRef[w.Text] = c;
+            netlist.Components.Add(c);
+        }
+
+        // Build nets, power rails first, then alphabetical
+        netlist.Nets.Clear();
+        int connections = 0;
+        var orderedNetNames = membersByName.Keys
+            .OrderBy(n => PowerNetRank(n))
+            .ThenBy(n => n, StringComparer.Ordinal)
+            .ToList();
+
+        foreach (var netName in orderedNetNames)
+        {
+            netlist.Nets.Add(new NetlistNet { Name = netName });
+
+            var memberRefs = membersByName[netName]
+                .Where(m => m.Kind == WireTracer.TextKind.Designator)
+                .Select(m => m.Text)
+                .Distinct(StringComparer.Ordinal);
+
+            foreach (var refName in memberRefs)
+            {
+                if (!componentByRef.TryGetValue(refName, out var comp)) continue;
+                int pinNumber = comp.Pins.Count + 1;
+                comp.Pins.Add(new NetlistPin
+                {
+                    Number = pinNumber.ToString(),
+                    Net = netName,
+                });
+                connections++;
+            }
+        }
+
+        sw.Stop();
+        long totalElapsed = phase1.ElapsedMs + phase2.ElapsedMs + sw.ElapsedMilliseconds;
+
+        // Refresh diagnostic notes
+        netlist.Notes.RemoveAll(n => n.StartsWith("OCR:", StringComparison.Ordinal)
+                                  || n.StartsWith("Trace:", StringComparison.Ordinal)
+                                  || n.StartsWith("Click \"Extract", StringComparison.Ordinal)
+                                  || n.StartsWith("Step ", StringComparison.Ordinal));
+        netlist.Notes.Add($"OCR: recognised {phase1.AllWords.Count} word(s).");
+        netlist.Notes.Add($"OCR: {phase1.Designators.Count} reference designator(s), {phase1.NetLabels.Count} net label(s).");
+        var traceStats = traceResult.Stats;
+        string yoloStatus = traceStats.YoloLoaded
+            ? $"YOLO: {traceStats.YoloRawDetections} raw detections"
+            : "YOLO: not loaded";
+        string symbolNote = traceStats.SymbolsViaYolo > 0
+            ? $"{traceStats.SymbolsFound} symbol(s) located ({traceStats.SymbolsViaYolo} YOLO, {traceStats.SymbolsViaGeometric} geometric)"
+            : $"{traceStats.SymbolsFound} symbol(s) located ({yoloStatus})";
+        netlist.Notes.Add($"Trace: {traceStats.ConnectedComponents} CC(s), " +
+                          $"{symbolNote}, " +
+                          $"{traceStats.Nets} traced group(s) → {membersByName.Count} named net(s), " +
+                          $"{traceStats.IsolatedTextBoxes} isolated text box(es), " +
+                          $"{connections} pin↔net connection(s), " +
+                          $"total time {totalElapsed} ms.");
+
+        var stats = new ExtractionStats(
+            phase1.AllWords.Count, phase1.Designators.Count, phase1.NetLabels.Count,
+            membersByName.Count, connections,
+            totalElapsed);
+
+        return new ExtractionResult
+        {
+            Stats = stats,
+            AllWords = phase1.AllWords,
+            Designators = phase1.Designators,
+            NetLabels = phase1.NetLabels,
             SymbolBoxes = traceResult.SymbolBoxes,
             YoloHits = traceResult.YoloHits,
             Pins = traceResult.Pins,
