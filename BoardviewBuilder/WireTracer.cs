@@ -52,7 +52,19 @@ public static class WireTracer
         int WireCC,             // CC label of the wire connected to this pin
         string Side);           // "Top", "Bottom", "Left", "Right"
 
-    /// <summary>A wire segment (bounding box of a single wire CC).</summary>
+    /// <summary>A traced wire path - a list of points from one pin/junction to another.</summary>
+    public sealed class TracedWire
+    {
+        public List<Point> Path { get; } = new();
+        public string? StartPin { get; set; }  // e.g. "R1.L" or null if junction
+        public string? EndPin { get; set; }    // e.g. "R2.R" or null if junction
+        public Rectangle Bounds { get; set; }
+    }
+
+    /// <summary>A wire junction where multiple wires meet.</summary>
+    public readonly record struct WireJunction(Point Location, int ConnectionCount);
+
+    /// <summary>A wire segment (bounding box of a single wire CC) - kept for compatibility.</summary>
     public readonly record struct WireSegment(
         int CCLabel,
         Rectangle Bounds,
@@ -88,6 +100,10 @@ public static class WireTracer
         public required IReadOnlyList<DetectedPin> Pins { get; init; }
         /// <summary>Wire segments with their bounding boxes.</summary>
         public required IReadOnlyList<WireSegment> Wires { get; init; }
+        /// <summary>Traced wire paths.</summary>
+        public required IReadOnlyList<TracedWire> TracedWires { get; init; }
+        /// <summary>Wire junctions where multiple wires meet.</summary>
+        public required IReadOnlyList<WireJunction> Junctions { get; init; }
     }
 
     // Singleton YOLO detector — loaded once on first use, cached for the session.
@@ -256,11 +272,113 @@ public static class WireTracer
         }
 
         // 6) NEW: Pin detection - find where wires cross YOLO box edges
+        //    Create a copy of ink mask with text erased, but KEEP ink that connects outside the text box
+        //    (this preserves wires that pass through text areas like "+" signs)
+        var inkForPins = (bool[])ink.Clone();
+        foreach (var tb in allTextBoxes)
+        {
+            int margin = 2;
+            int x0 = Math.Max(0, tb.X - margin);
+            int y0 = Math.Max(0, tb.Y - margin);
+            int x1 = Math.Min(w, tb.Right + margin);
+            int y1 = Math.Min(h, tb.Bottom + margin);
+
+            // Find all ink pixels inside this text box that connect to ink OUTSIDE the box
+            // These are wires passing through - we keep them
+            var keepPixels = new HashSet<int>();
+
+            // BFS from each edge pixel that has ink, to find connected ink inside the box
+            var visited = new bool[w * h];
+            var queue = new Queue<Point>();
+
+            // Seed from all edge pixels of the text box that have ink AND connect to ink outside
+            // Top edge
+            for (int x = x0; x < x1; x++)
+            {
+                if (y0 > 0 && ink[y0 * w + x] && ink[(y0 - 1) * w + x])
+                    queue.Enqueue(new Point(x, y0));
+            }
+            // Bottom edge
+            for (int x = x0; x < x1; x++)
+            {
+                if (y1 - 1 < h - 1 && ink[(y1 - 1) * w + x] && ink[y1 * w + x])
+                    queue.Enqueue(new Point(x, y1 - 1));
+            }
+            // Left edge
+            for (int y = y0; y < y1; y++)
+            {
+                if (x0 > 0 && ink[y * w + x0] && ink[y * w + (x0 - 1)])
+                    queue.Enqueue(new Point(x0, y));
+            }
+            // Right edge
+            for (int y = y0; y < y1; y++)
+            {
+                if (x1 - 1 < w - 1 && ink[y * w + (x1 - 1)] && ink[y * w + x1])
+                    queue.Enqueue(new Point(x1 - 1, y));
+            }
+
+            // BFS to find all connected ink inside the box that connects to outside
+            while (queue.Count > 0)
+            {
+                var pt = queue.Dequeue();
+                int idx = pt.Y * w + pt.X;
+
+                if (pt.X < x0 || pt.X >= x1 || pt.Y < y0 || pt.Y >= y1) continue;
+                if (visited[idx]) continue;
+                if (!ink[idx]) continue;
+
+                visited[idx] = true;
+                keepPixels.Add(idx);
+
+                // Add neighbors (4-connected)
+                queue.Enqueue(new Point(pt.X - 1, pt.Y));
+                queue.Enqueue(new Point(pt.X + 1, pt.Y));
+                queue.Enqueue(new Point(pt.X, pt.Y - 1));
+                queue.Enqueue(new Point(pt.X, pt.Y + 1));
+            }
+
+            // Erase all ink inside the text box EXCEPT pixels that connect to outside (wires)
+            for (int y = y0; y < y1; y++)
+            {
+                int rs = y * w;
+                for (int x = x0; x < x1; x++)
+                {
+                    int idx = rs + x;
+                    if (!keepPixels.Contains(idx))
+                        inkForPins[idx] = false;
+                }
+            }
+        }
+
         var detectedPins = new List<DetectedPin>();
         if (yoloHits != null)
         {
             foreach (var hit in yoloHits)
             {
+                // Skip YOLO boxes that overlap heavily with OCR text boxes
+                // (these are likely false detections on text, not actual symbols)
+                bool overlapsText = false;
+                foreach (var tb in allTextBoxes)
+                {
+                    // Calculate intersection
+                    int ix0 = Math.Max(hit.Bounds.X, tb.X);
+                    int iy0 = Math.Max(hit.Bounds.Y, tb.Y);
+                    int ix1 = Math.Min(hit.Bounds.Right, tb.Right);
+                    int iy1 = Math.Min(hit.Bounds.Bottom, tb.Bottom);
+                    if (ix1 > ix0 && iy1 > iy0)
+                    {
+                        int intersection = (ix1 - ix0) * (iy1 - iy0);
+                        int textArea = tb.Width * tb.Height;
+                        // If text box is mostly inside YOLO box, it's probably a text detection
+                        if (textArea > 0 && intersection > textArea * 0.5)
+                        {
+                            overlapsText = true;
+                            break;
+                        }
+                    }
+                }
+                if (overlapsText) continue;
+
                 // Use the YOLO class as designator (e.g., "R", "C", "Q")
                 // Try to find matching designator text nearby
                 string desig = hit.Kind;
@@ -289,15 +407,17 @@ public static class WireTracer
                 }
 
                 // Detect pins at YOLO box edges
-                var edgePins = DetectPinsAtYoloEdges(ink, w, h, hit.Bounds, desig, allTextBoxes);
+                // Use inkForPins (text erased) for edge detection, but original ink for outside check
+                var edgePins = DetectPinsAtYoloEdgesSimple(inkForPins, ink, w, h, hit.Bounds, desig);
                 detectedPins.AddRange(edgePins);
             }
         }
 
-        // No wire segments for now (removed)
+        // 7) Trace wires from pins - follow ink to find wire paths and junctions
+        var (tracedWires, junctions) = TraceWiresFromPins(inkForPins, w, h, detectedPins, yoloHits);
         var wireSegments = new List<WireSegment>();
 
-        // 7) Group by CC label (using original labels for net grouping).
+        // 8) Group by CC label (using original labels for net grouping).
         var byCC = new Dictionary<int, TracedNet>();
         int isolated = 0;
         for (int i = 0; i < texts.Count; i++)
@@ -312,7 +432,7 @@ public static class WireTracer
             grp.Members.Add(texts[i]);
         }
 
-        // 8) Name each group.
+        // 9) Name each group.
         int autoIdx = 1;
         foreach (var grp in byCC.Values)
         {
@@ -327,7 +447,7 @@ public static class WireTracer
         var stats = new TraceStats(ccCount, byCC.Count, isolated, symbolsFound,
                                    symbolsViaYolo, symbolsViaGeometric,
                                    _yoloDetector != null, yoloRawCount, yoloDebug,
-                                   detectedPins.Count, wireSegments.Count, sw.ElapsedMilliseconds);
+                                   detectedPins.Count, tracedWires.Count, sw.ElapsedMilliseconds);
         return new TraceResult
         {
             Nets = byCC.Values.ToList(),
@@ -336,6 +456,8 @@ public static class WireTracer
             YoloHits = yoloHits ?? new List<SymbolDetector.SymbolHit>(),
             Pins = detectedPins,
             Wires = wireSegments,
+            TracedWires = tracedWires,
+            Junctions = junctions,
         };
     }
 
@@ -603,7 +725,190 @@ public static class WireTracer
     }
 
     // -----------------------------------------------------------------------
-    //  Pin detection at YOLO bounding box edges.
+    //  Pin detection - scan OUTSIDE the YOLO box for wires.
+    //  For ICs with thick outlines, the outline touches the box edge and creates
+    //  one long continuous run. Instead, we scan just outside the box to find
+    //  the actual wires exiting the symbol.
+    // -----------------------------------------------------------------------
+    private static List<DetectedPin> DetectPinsAtYoloEdgesSimple(
+        bool[] inkEdge, bool[] inkOriginal, int w, int h, Rectangle bbox, string designator)
+    {
+        var pins = new List<DetectedPin>();
+        var ink = inkOriginal;
+
+        // How far outside the box to look for wires
+        int outsideMargin = 8;
+
+        // TOP: scan horizontal strip just above the box for vertical wires
+        {
+            int y = bbox.Y - 1;
+            if (y >= 0)
+            {
+                int runStart = -1;
+                for (int x = Math.Max(0, bbox.X); x < Math.Min(w, bbox.Right); x++)
+                {
+                    // Check if there's ink in the strip above the box
+                    bool hasWire = false;
+                    for (int dy = 0; dy < outsideMargin && y - dy >= 0; dy++)
+                    {
+                        if (ink[(y - dy) * w + x])
+                        {
+                            hasWire = true;
+                            break;
+                        }
+                    }
+
+                    if (hasWire)
+                    {
+                        if (runStart < 0) runStart = x;
+                    }
+                    else if (runStart >= 0)
+                    {
+                        int cx = (runStart + x - 1) / 2;
+                        bool duplicate = pins.Any(p => p.Side == "Top" && Math.Abs(p.Location.X - cx) < 10);
+                        if (!duplicate)
+                            pins.Add(new DetectedPin(designator, new Point(cx, bbox.Y), 0, "Top"));
+                        runStart = -1;
+                    }
+                }
+                if (runStart >= 0)
+                {
+                    int cx = (runStart + Math.Min(w, bbox.Right) - 1) / 2;
+                    bool duplicate = pins.Any(p => p.Side == "Top" && Math.Abs(p.Location.X - cx) < 10);
+                    if (!duplicate)
+                        pins.Add(new DetectedPin(designator, new Point(cx, bbox.Y), 0, "Top"));
+                }
+            }
+        }
+
+        // BOTTOM: scan horizontal strip just below the box
+        {
+            int y = bbox.Bottom;
+            if (y < h)
+            {
+                int runStart = -1;
+                for (int x = Math.Max(0, bbox.X); x < Math.Min(w, bbox.Right); x++)
+                {
+                    bool hasWire = false;
+                    for (int dy = 0; dy < outsideMargin && y + dy < h; dy++)
+                    {
+                        if (ink[(y + dy) * w + x])
+                        {
+                            hasWire = true;
+                            break;
+                        }
+                    }
+
+                    if (hasWire)
+                    {
+                        if (runStart < 0) runStart = x;
+                    }
+                    else if (runStart >= 0)
+                    {
+                        int cx = (runStart + x - 1) / 2;
+                        bool duplicate = pins.Any(p => p.Side == "Bottom" && Math.Abs(p.Location.X - cx) < 10);
+                        if (!duplicate)
+                            pins.Add(new DetectedPin(designator, new Point(cx, bbox.Bottom - 1), 0, "Bottom"));
+                        runStart = -1;
+                    }
+                }
+                if (runStart >= 0)
+                {
+                    int cx = (runStart + Math.Min(w, bbox.Right) - 1) / 2;
+                    bool duplicate = pins.Any(p => p.Side == "Bottom" && Math.Abs(p.Location.X - cx) < 10);
+                    if (!duplicate)
+                        pins.Add(new DetectedPin(designator, new Point(cx, bbox.Bottom - 1), 0, "Bottom"));
+                }
+            }
+        }
+
+        // LEFT: scan vertical strip just left of the box
+        {
+            int x = bbox.X - 1;
+            if (x >= 0)
+            {
+                int runStart = -1;
+                for (int y = Math.Max(0, bbox.Y); y < Math.Min(h, bbox.Bottom); y++)
+                {
+                    bool hasWire = false;
+                    for (int dx = 0; dx < outsideMargin && x - dx >= 0; dx++)
+                    {
+                        if (ink[y * w + (x - dx)])
+                        {
+                            hasWire = true;
+                            break;
+                        }
+                    }
+
+                    if (hasWire)
+                    {
+                        if (runStart < 0) runStart = y;
+                    }
+                    else if (runStart >= 0)
+                    {
+                        int cy = (runStart + y - 1) / 2;
+                        bool duplicate = pins.Any(p => p.Side == "Left" && Math.Abs(p.Location.Y - cy) < 10);
+                        if (!duplicate)
+                            pins.Add(new DetectedPin(designator, new Point(bbox.X, cy), 0, "Left"));
+                        runStart = -1;
+                    }
+                }
+                if (runStart >= 0)
+                {
+                    int cy = (runStart + Math.Min(h, bbox.Bottom) - 1) / 2;
+                    bool duplicate = pins.Any(p => p.Side == "Left" && Math.Abs(p.Location.Y - cy) < 10);
+                    if (!duplicate)
+                        pins.Add(new DetectedPin(designator, new Point(bbox.X, cy), 0, "Left"));
+                }
+            }
+        }
+
+        // RIGHT: scan vertical strip just right of the box
+        {
+            int x = bbox.Right;
+            if (x < w)
+            {
+                int runStart = -1;
+                for (int y = Math.Max(0, bbox.Y); y < Math.Min(h, bbox.Bottom); y++)
+                {
+                    bool hasWire = false;
+                    for (int dx = 0; dx < outsideMargin && x + dx < w; dx++)
+                    {
+                        if (ink[y * w + (x + dx)])
+                        {
+                            hasWire = true;
+                            break;
+                        }
+                    }
+
+                    if (hasWire)
+                    {
+                        if (runStart < 0) runStart = y;
+                    }
+                    else if (runStart >= 0)
+                    {
+                        int cy = (runStart + y - 1) / 2;
+                        bool duplicate = pins.Any(p => p.Side == "Right" && Math.Abs(p.Location.Y - cy) < 10);
+                        if (!duplicate)
+                            pins.Add(new DetectedPin(designator, new Point(bbox.Right - 1, cy), 0, "Right"));
+                        runStart = -1;
+                    }
+                }
+                if (runStart >= 0)
+                {
+                    int cy = (runStart + Math.Min(h, bbox.Bottom) - 1) / 2;
+                    bool duplicate = pins.Any(p => p.Side == "Right" && Math.Abs(p.Location.Y - cy) < 10);
+                    if (!duplicate)
+                        pins.Add(new DetectedPin(designator, new Point(bbox.Right - 1, cy), 0, "Right"));
+                }
+            }
+        }
+
+        return pins;
+    }
+
+    // -----------------------------------------------------------------------
+    //  Pin detection at YOLO bounding box edges (OLD - kept for reference).
     //  Scans each edge for runs of ink pixels (wires) that cross the edge.
     //  Excludes any ink that falls inside OCR text boxes.
     //  A pin is detected when ink pixels cross the YOLO box boundary.
@@ -613,7 +918,58 @@ public static class WireTracer
     {
         var pins = new List<DetectedPin>();
 
-        // Helper: check if a point is inside any text box
+        // Helper: check if an edge overlaps with any text box
+        bool EdgeOverlapsText(string side)
+        {
+            const int margin = 15; // Larger margin to catch text near edges
+            foreach (var tb in textBoxes)
+            {
+                // Expand text box by margin
+                var expanded = new Rectangle(tb.X - margin, tb.Y - margin,
+                                            tb.Width + margin * 2, tb.Height + margin * 2);
+                switch (side)
+                {
+                    case "Top":
+                        if (bbox.Y >= expanded.Y && bbox.Y <= expanded.Bottom &&
+                            bbox.X < expanded.Right && bbox.Right > expanded.X)
+                            return true;
+                        break;
+                    case "Bottom":
+                        int bottomY = bbox.Bottom - 1;
+                        if (bottomY >= expanded.Y && bottomY <= expanded.Bottom &&
+                            bbox.X < expanded.Right && bbox.Right > expanded.X)
+                            return true;
+                        break;
+                    case "Left":
+                        if (bbox.X >= expanded.X && bbox.X <= expanded.Right &&
+                            bbox.Y < expanded.Bottom && bbox.Bottom > expanded.Y)
+                            return true;
+                        break;
+                    case "Right":
+                        int rightX = bbox.Right - 1;
+                        if (rightX >= expanded.X && rightX <= expanded.Right &&
+                            bbox.Y < expanded.Bottom && bbox.Bottom > expanded.Y)
+                            return true;
+                        break;
+                }
+            }
+            return false;
+        }
+
+        // Helper: check if a point is inside or near any text box (with margin)
+        bool IsInsideOrNearText(int px, int py, int margin = 15)
+        {
+            foreach (var tb in textBoxes)
+            {
+                // Expand text box by margin to catch nearby points
+                if (px >= tb.X - margin && px < tb.Right + margin &&
+                    py >= tb.Y - margin && py < tb.Bottom + margin)
+                    return true;
+            }
+            return false;
+        }
+
+        // Helper: check if a point is inside any text box (exact)
         bool IsInsideText(int px, int py)
         {
             foreach (var tb in textBoxes)
@@ -649,7 +1005,8 @@ public static class WireTracer
             return inkCount >= 3;
         }
 
-        // Scan top edge
+        // Scan top edge (skip if edge overlaps text)
+        if (!EdgeOverlapsText("Top"))
         {
             int y = bbox.Y;
             if (y >= 0 && y < h)
@@ -658,7 +1015,7 @@ public static class WireTracer
                 for (int x = bbox.X; x < bbox.Right && x < w; x++)
                 {
                     if (x < 0) continue;
-                    bool isInk = ink[y * w + x] && !IsInsideText(x, y);
+                    bool isInk = ink[y * w + x] && !IsInsideOrNearText(x, y);
                     if (isInk)
                     {
                         if (runStart < 0) runStart = x;
@@ -666,7 +1023,7 @@ public static class WireTracer
                     else if (runStart >= 0)
                     {
                         int cx = (runStart + x - 1) / 2;
-                        if (HasInkOutside(cx, y, "Top"))
+                        if (!IsInsideOrNearText(cx, y) && HasInkOutside(cx, y, "Top"))
                             pins.Add(new DetectedPin(designator, new Point(cx, y), 0, "Top"));
                         runStart = -1;
                     }
@@ -674,13 +1031,14 @@ public static class WireTracer
                 if (runStart >= 0)
                 {
                     int cx = (runStart + Math.Min(bbox.Right, w) - 1) / 2;
-                    if (HasInkOutside(cx, y, "Top"))
+                    if (!IsInsideOrNearText(cx, y) && HasInkOutside(cx, y, "Top"))
                         pins.Add(new DetectedPin(designator, new Point(cx, y), 0, "Top"));
                 }
             }
         }
 
-        // Scan bottom edge
+        // Scan bottom edge (skip if edge overlaps text)
+        if (!EdgeOverlapsText("Bottom"))
         {
             int y = bbox.Bottom - 1;
             if (y >= 0 && y < h)
@@ -689,7 +1047,7 @@ public static class WireTracer
                 for (int x = bbox.X; x < bbox.Right && x < w; x++)
                 {
                     if (x < 0) continue;
-                    bool isInk = ink[y * w + x] && !IsInsideText(x, y);
+                    bool isInk = ink[y * w + x] && !IsInsideOrNearText(x, y);
                     if (isInk)
                     {
                         if (runStart < 0) runStart = x;
@@ -697,7 +1055,7 @@ public static class WireTracer
                     else if (runStart >= 0)
                     {
                         int cx = (runStart + x - 1) / 2;
-                        if (HasInkOutside(cx, y, "Bottom"))
+                        if (!IsInsideOrNearText(cx, y) && HasInkOutside(cx, y, "Bottom"))
                             pins.Add(new DetectedPin(designator, new Point(cx, y), 0, "Bottom"));
                         runStart = -1;
                     }
@@ -705,13 +1063,14 @@ public static class WireTracer
                 if (runStart >= 0)
                 {
                     int cx = (runStart + Math.Min(bbox.Right, w) - 1) / 2;
-                    if (HasInkOutside(cx, y, "Bottom"))
+                    if (!IsInsideOrNearText(cx, y) && HasInkOutside(cx, y, "Bottom"))
                         pins.Add(new DetectedPin(designator, new Point(cx, y), 0, "Bottom"));
                 }
             }
         }
 
-        // Scan left edge
+        // Scan left edge (skip if edge overlaps text)
+        if (!EdgeOverlapsText("Left"))
         {
             int x = bbox.X;
             if (x >= 0 && x < w)
@@ -720,7 +1079,7 @@ public static class WireTracer
                 for (int y = bbox.Y; y < bbox.Bottom && y < h; y++)
                 {
                     if (y < 0) continue;
-                    bool isInk = ink[y * w + x] && !IsInsideText(x, y);
+                    bool isInk = ink[y * w + x] && !IsInsideOrNearText(x, y);
                     if (isInk)
                     {
                         if (runStart < 0) runStart = y;
@@ -728,7 +1087,7 @@ public static class WireTracer
                     else if (runStart >= 0)
                     {
                         int cy = (runStart + y - 1) / 2;
-                        if (HasInkOutside(x, cy, "Left"))
+                        if (!IsInsideOrNearText(x, cy) && HasInkOutside(x, cy, "Left"))
                             pins.Add(new DetectedPin(designator, new Point(x, cy), 0, "Left"));
                         runStart = -1;
                     }
@@ -736,13 +1095,14 @@ public static class WireTracer
                 if (runStart >= 0)
                 {
                     int cy = (runStart + Math.Min(bbox.Bottom, h) - 1) / 2;
-                    if (HasInkOutside(x, cy, "Left"))
+                    if (!IsInsideOrNearText(x, cy) && HasInkOutside(x, cy, "Left"))
                         pins.Add(new DetectedPin(designator, new Point(x, cy), 0, "Left"));
                 }
             }
         }
 
-        // Scan right edge
+        // Scan right edge (skip if edge overlaps text)
+        if (!EdgeOverlapsText("Right"))
         {
             int x = bbox.Right - 1;
             if (x >= 0 && x < w)
@@ -751,7 +1111,7 @@ public static class WireTracer
                 for (int y = bbox.Y; y < bbox.Bottom && y < h; y++)
                 {
                     if (y < 0) continue;
-                    bool isInk = ink[y * w + x] && !IsInsideText(x, y);
+                    bool isInk = ink[y * w + x] && !IsInsideOrNearText(x, y);
                     if (isInk)
                     {
                         if (runStart < 0) runStart = y;
@@ -759,7 +1119,7 @@ public static class WireTracer
                     else if (runStart >= 0)
                     {
                         int cy = (runStart + y - 1) / 2;
-                        if (HasInkOutside(x, cy, "Right"))
+                        if (!IsInsideOrNearText(x, cy) && HasInkOutside(x, cy, "Right"))
                             pins.Add(new DetectedPin(designator, new Point(x, cy), 0, "Right"));
                         runStart = -1;
                     }
@@ -767,12 +1127,137 @@ public static class WireTracer
                 if (runStart >= 0)
                 {
                     int cy = (runStart + Math.Min(bbox.Bottom, h) - 1) / 2;
-                    if (HasInkOutside(x, cy, "Right"))
+                    if (!IsInsideOrNearText(x, cy) && HasInkOutside(x, cy, "Right"))
                         pins.Add(new DetectedPin(designator, new Point(x, cy), 0, "Right"));
                 }
             }
         }
 
         return pins;
+    }
+
+    // -----------------------------------------------------------------------
+    //  Wire tracing - find which pins are connected via ink (ratsnest style).
+    //  Uses BFS flood-fill to find all pins reachable from each pin.
+    // -----------------------------------------------------------------------
+    private static (List<TracedWire> wires, List<WireJunction> junctions) TraceWiresFromPins(
+        bool[] ink, int w, int h,
+        IReadOnlyList<DetectedPin> pins,
+        IReadOnlyList<SymbolDetector.SymbolHit>? yoloHits)
+    {
+        var tracedWires = new List<TracedWire>();
+        var junctions = new List<WireJunction>(); // Empty - not used
+
+        if (pins.Count < 2) return (tracedWires, junctions);
+
+        // Create a set of YOLO bounding boxes - shrink slightly to allow pins at edges
+        var symbolBoxes = new List<Rectangle>();
+        if (yoloHits != null)
+        {
+            foreach (var hit in yoloHits)
+            {
+                // Shrink box by 2 pixels so pins at edges aren't considered "inside"
+                var shrunk = Rectangle.Inflate(hit.Bounds, -2, -2);
+                if (shrunk.Width > 0 && shrunk.Height > 0)
+                    symbolBoxes.Add(shrunk);
+            }
+        }
+
+        // Helper: check if point is deep inside any symbol box (not at edge)
+        bool IsDeepInsideSymbol(int px, int py)
+        {
+            foreach (var box in symbolBoxes)
+            {
+                if (px >= box.X && px < box.Right && py >= box.Y && py < box.Bottom)
+                    return true;
+            }
+            return false;
+        }
+
+        // Track which pin pairs we've already connected (to avoid duplicates)
+        var connectedPairs = new HashSet<string>();
+
+        // For each pin, flood-fill to find other pins it connects to
+        foreach (var startPin in pins)
+        {
+            string startPinId = $"{startPin.Designator}.{startPin.Side[0]}";
+
+            // BFS from this pin's location
+            var visited = new bool[w * h];
+            var queue = new Queue<Point>();
+
+            // Start from pin location and a few pixels around it to ensure we catch the wire
+            queue.Enqueue(startPin.Location);
+            for (int dy = -3; dy <= 3; dy++)
+            {
+                for (int dx = -3; dx <= 3; dx++)
+                {
+                    int nx = startPin.Location.X + dx;
+                    int ny = startPin.Location.Y + dy;
+                    if (nx >= 0 && nx < w && ny >= 0 && ny < h)
+                        queue.Enqueue(new Point(nx, ny));
+                }
+            }
+
+            while (queue.Count > 0)
+            {
+                var pt = queue.Dequeue();
+                int idx = pt.Y * w + pt.X;
+
+                if (pt.X < 0 || pt.X >= w || pt.Y < 0 || pt.Y >= h) continue;
+                if (visited[idx]) continue;
+                if (!ink[idx]) continue;
+                if (IsDeepInsideSymbol(pt.X, pt.Y)) continue;
+
+                visited[idx] = true;
+
+                // Check if we reached another pin
+                foreach (var otherPin in pins)
+                {
+                    if (otherPin.Designator == startPin.Designator && otherPin.Side == startPin.Side) continue;
+
+                    int distSq = (pt.X - otherPin.Location.X) * (pt.X - otherPin.Location.X) +
+                                (pt.Y - otherPin.Location.Y) * (pt.Y - otherPin.Location.Y);
+                    if (distSq < 225) // Within 15 pixels
+                    {
+                        string endPinId = $"{otherPin.Designator}.{otherPin.Side[0]}";
+
+                        // Create unique pair key (sorted to avoid A-B and B-A duplicates)
+                        string pairKey = string.CompareOrdinal(startPinId, endPinId) < 0
+                            ? $"{startPinId}|{endPinId}"
+                            : $"{endPinId}|{startPinId}";
+
+                        if (!connectedPairs.Contains(pairKey))
+                        {
+                            connectedPairs.Add(pairKey);
+
+                            // Create wire with just start and end points (ratsnest style)
+                            var wire = new TracedWire
+                            {
+                                StartPin = startPinId,
+                                EndPin = endPinId
+                            };
+                            wire.Path.Add(startPin.Location);
+                            wire.Path.Add(otherPin.Location);
+                            wire.Bounds = Rectangle.FromLTRB(
+                                Math.Min(startPin.Location.X, otherPin.Location.X),
+                                Math.Min(startPin.Location.Y, otherPin.Location.Y),
+                                Math.Max(startPin.Location.X, otherPin.Location.X),
+                                Math.Max(startPin.Location.Y, otherPin.Location.Y));
+
+                            tracedWires.Add(wire);
+                        }
+                    }
+                }
+
+                // Add neighbors to queue (4-connected)
+                queue.Enqueue(new Point(pt.X - 1, pt.Y));
+                queue.Enqueue(new Point(pt.X + 1, pt.Y));
+                queue.Enqueue(new Point(pt.X, pt.Y - 1));
+                queue.Enqueue(new Point(pt.X, pt.Y + 1));
+            }
+        }
+
+        return (tracedWires, junctions);
     }
 }

@@ -167,6 +167,10 @@ public static class SchematicImageLoader
         public required IReadOnlyList<WireTracer.DetectedPin> Pins { get; init; }
         /// <summary>Wire segments with their bounding boxes.</summary>
         public required IReadOnlyList<WireTracer.WireSegment> Wires { get; init; }
+        /// <summary>Traced wire paths from pin to pin or junction.</summary>
+        public required IReadOnlyList<WireTracer.TracedWire> TracedWires { get; init; }
+        /// <summary>Wire junctions where multiple wires meet.</summary>
+        public required IReadOnlyList<WireTracer.WireJunction> Junctions { get; init; }
     }
 
     /// <summary>
@@ -324,6 +328,8 @@ public static class SchematicImageLoader
             YoloHits = traceResult.YoloHits,
             Pins = traceResult.Pins,
             Wires = traceResult.Wires,
+            TracedWires = traceResult.TracedWires,
+            Junctions = traceResult.Junctions,
         };
     }
 

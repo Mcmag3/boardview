@@ -44,6 +44,15 @@ public static class OcrEngine
         if (string.IsNullOrEmpty(word)) return false;
         if (ReferenceDesignatorRegex.IsMatch(word)) return false;
         if (!NetLabelRegex.IsMatch(word)) return false;
+
+        // Must have at least 3 characters (exclude single-char like "+" and
+        // two-char like "+1", "+I", "-2" which are polarity markers on capacitors)
+        if (word.Length < 3) return false;
+
+        // Skip anything starting with + or - that's short (polarity markers)
+        if ((word[0] == '+' || word[0] == '-') && word.Length <= 3)
+            return false;
+
         // Must contain at least one letter so pure-number tokens like "42"
         // don't get misclassified as a net.
         bool hasLetter = false;

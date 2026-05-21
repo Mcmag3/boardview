@@ -51,6 +51,7 @@ public sealed class MainForm : Form
     private readonly Label _adjThresholdVal;
     private readonly CheckBox _hideOcrBoxes;
     private readonly CheckBox _showPins;
+    private readonly CheckBox _showWires;
 
     private SchematicImageLoader.LoadResult? _schematic;
     private Bitmap? _displayBitmap;          // processed image currently shown
@@ -93,7 +94,7 @@ public sealed class MainForm : Form
          _adjThresholdEnabled, _adjThreshold,
          _adjRotateBtn, _adjResetBtn,
          _adjBrightnessVal, _adjContrastVal, _adjThresholdVal,
-         _hideOcrBoxes, _showPins) = BuildSchematicTab(schemTab);
+         _hideOcrBoxes, _showPins, _showWires) = BuildSchematicTab(schemTab);
     }
 
     // ---------------------------------------------------------------------
@@ -244,7 +245,7 @@ public sealed class MainForm : Form
              CheckBox thresholdEnabled, TrackBar threshold,
              Button rotate, Button reset,
              Label brightVal, Label contrastVal, Label threshVal,
-             CheckBox hideOcrBoxes, CheckBox showPins) BuildSchematicTab(TabPage tab)
+             CheckBox hideOcrBoxes, CheckBox showPins, CheckBox showWires) BuildSchematicTab(TabPage tab)
     {
         var root = new TableLayoutPanel
         {
@@ -311,10 +312,12 @@ public sealed class MainForm : Form
         var cbInv  = new CheckBox { Text = "Invert",    AutoSize = true, Margin = new Padding(3, 8, 8, 3) };
         var cbHideOcr = new CheckBox { Text = "Hide OCR boxes", AutoSize = true, Margin = new Padding(3, 8, 8, 3) };
         var cbShowPins = new CheckBox { Text = "Show Pins", AutoSize = true, Margin = new Padding(3, 8, 8, 3), Checked = true };
+        var cbShowWires = new CheckBox { Text = "Show Wires", AutoSize = true, Margin = new Padding(3, 8, 8, 3), Checked = true };
         adjLayout.Controls.Add(cbGray, 0, 0);
         adjLayout.Controls.Add(cbInv,  1, 0);
         adjLayout.Controls.Add(cbHideOcr, 2, 0);
         adjLayout.Controls.Add(cbShowPins, 3, 0);
+        adjLayout.Controls.Add(cbShowWires, 4, 0);
 
         adjLayout.Controls.Add(new Label { Text = "Brightness:", AutoSize = true, Margin = new Padding(8, 8, 3, 3) }, 5, 0);
         var tbBright = new TrackBar { Minimum = -100, Maximum = 100, Value = 0, TickFrequency = 25, Width = 120, AutoSize = false, Height = 30 };
@@ -463,6 +466,7 @@ public sealed class MainForm : Form
         tbThresh.ValueChanged   += (_, _) => OnAdjChanged();
         cbHideOcr.CheckedChanged += (_, _) => RefreshProcessedImage(img, zoom);
         cbShowPins.CheckedChanged += (_, _) => RefreshProcessedImage(img, zoom);
+        cbShowWires.CheckedChanged += (_, _) => RefreshProcessedImage(img, zoom);
 
         rotateBtn.Click += (_, _) =>
         {
@@ -492,7 +496,7 @@ public sealed class MainForm : Form
                 cbGray, cbInv, tbBright, tbCont, cbThresh, tbThresh,
                 rotateBtn, resetBtn,
                 lblBright, lblCont, lblThresh,
-                cbHideOcr, cbShowPins);
+                cbHideOcr, cbShowPins, cbShowWires);
     }
 
     // ---- Image loading -------------------------------------------------------
@@ -645,7 +649,8 @@ public sealed class MainForm : Form
         if (_lastOcr != null)
             DrawOcrOverlay(newBmp, _lastOcr,
                 hideOcrText: _hideOcrBoxes.Checked,
-                showPins: _showPins.Checked);
+                showPins: _showPins.Checked,
+                showWires: _showWires.Checked);
 
         var oldImage = img.Image;
         img.Image = newBmp;
@@ -665,13 +670,14 @@ public sealed class MainForm : Form
     ///   * blue   = detected component SYMBOL for a designator (the largest
     ///              non-text connected component the tracer found near the
     ///              designator text — i.e. where the wires actually attach).
-    ///   * cyan   = wire segments (bounding boxes of traced wire CCs)
+    ///   * cyan   = traced wire paths (lines following ink pixels)
     ///   * orange circles = detected pins where wires connect to symbols
+    ///   * yellow filled circles = wire junctions where multiple wires meet
     /// Each text box is labelled with its recognised text; each symbol box
     /// is labelled with the designator it belongs to.
     /// When <paramref name="hideOcrText"/> is true, only YOLO boxes are drawn.</summary>
     private static void DrawOcrOverlay(Bitmap bmp, SchematicImageLoader.ExtractionResult ocr,
-        bool hideOcrText = false, bool showPins = true)
+        bool hideOcrText = false, bool showPins = true, bool showWires = true)
     {
         var designators = new HashSet<string>(ocr.Designators.Keys, StringComparer.Ordinal);
         var netLabels   = new HashSet<string>(ocr.NetLabels.Keys,   StringComparer.Ordinal);
@@ -760,6 +766,21 @@ public sealed class MainForm : Form
                 // Draw small label showing designator.side
                 string pinLabel = $"{pin.Designator}.{pin.Side[0]}";
                 g.DrawString(pinLabel, pinFont, brushPin, cx + pinRadius + 2, cy - 5);
+            }
+        }
+
+        // ---- Pass 4: Traced wires (blue lines pin-to-pin, ratsnest style) ----
+        if (showWires)
+        {
+            using var penWire = new Pen(Color.DodgerBlue, 2f);
+
+            // Draw straight lines between connected pins
+            foreach (var wire in ocr.TracedWires)
+            {
+                if (wire.Path.Count >= 2)
+                {
+                    g.DrawLine(penWire, wire.Path[0], wire.Path[wire.Path.Count - 1]);
+                }
             }
         }
     }
