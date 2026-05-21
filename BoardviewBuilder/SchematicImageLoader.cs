@@ -442,18 +442,20 @@ public static class SchematicImageLoader
     //  PHASE 3: Wire tracing (multi-step workflow)
     // -----------------------------------------------------------------------
     /// <summary>Phase 3: Run wire tracing and build netlist.
-    /// Takes Phase 2 result plus any manually added pins.
+    /// Takes Phase 2 result plus any manually added pins and remaining detected pins.
+    /// If remainingDetectedPins is provided, it replaces the detected pins from phase2.
     /// Returns the final ExtractionResult.</summary>
     public static ExtractionResult ExtractPhase3(
         Phase2ExtractionResult phase2,
         Netlist netlist,
-        IReadOnlyList<WireTracer.DetectedPin>? manualPins = null)
+        IReadOnlyList<WireTracer.DetectedPin>? manualPins = null,
+        IReadOnlyList<WireTracer.DetectedPin>? remainingDetectedPins = null)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var phase1 = phase2.Phase1;
 
-        // Run Phase 3 of wire tracer
-        var traceResult = WireTracer.TracePhase3(phase2.TracePhase2, manualPins);
+        // Run Phase 3 of wire tracer, passing remaining detected pins if available
+        var traceResult = WireTracer.TracePhase3(phase2.TracePhase2, manualPins, remainingDetectedPins: remainingDetectedPins);
         var tracedGroups = traceResult.Nets;
 
         // Merge groups by name

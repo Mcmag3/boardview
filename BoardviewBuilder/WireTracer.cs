@@ -860,10 +860,34 @@ public static class WireTracer
             detectedPins.AddRange(linePins);
         }
 
+        // Filter out pins that are INSIDE any symbol box (not on the edge)
+        // Keep only pins that are on or very close to the boundary
+        var filteredPins = new List<DetectedPin>();
+        foreach (var pin in detectedPins)
+        {
+            bool isInsideAnyBox = false;
+            foreach (var hit in allSymbolBoxes)
+            {
+                var b = hit.Bounds;
+                int margin = 3; // Allow pins within 3px of edge
+                // Check if pin is strictly inside (not near edge)
+                if (pin.Location.X > b.X + margin && pin.Location.X < b.Right - margin &&
+                    pin.Location.Y > b.Y + margin && pin.Location.Y < b.Bottom - margin)
+                {
+                    isInsideAnyBox = true;
+                    break;
+                }
+            }
+            if (!isInsideAnyBox)
+            {
+                filteredPins.Add(pin);
+            }
+        }
+
         return new Phase2Result
         {
             Phase1 = phase1,
-            Pins = detectedPins,
+            Pins = filteredPins,
             InkForWires = inkForPins,
         };
     }
@@ -877,15 +901,19 @@ public static class WireTracer
     public static TraceResult TracePhase3(
         Phase2Result phase2,
         IReadOnlyList<DetectedPin>? manualPins = null,
-        int netLabelRingMargin = 12)
+        int netLabelRingMargin = 12,
+        IReadOnlyList<DetectedPin>? remainingDetectedPins = null)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var phase1 = phase2.Phase1;
         int w = phase1.Width;
         int h = phase1.Height;
 
+        // Use remaining detected pins if provided (user deleted some), otherwise use all from phase2
+        var detectedPins = remainingDetectedPins ?? phase2.Pins;
+
         // Combine detected pins with manual pins
-        var allPins = new List<DetectedPin>(phase2.Pins);
+        var allPins = new List<DetectedPin>(detectedPins);
         if (manualPins != null)
         {
             allPins.AddRange(manualPins);

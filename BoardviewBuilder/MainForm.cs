@@ -1,29 +1,17 @@
+using System.Runtime.InteropServices;
 using System.Text;
 
 namespace BoardviewBuilder;
 
 /// <summary>
-/// Main window. Hosts two independent pipelines as separate tabs:
-///
-///   Tab 1 "CSV → BRD"           : existing flow, unchanged behaviour.
-///   Tab 2 "Schematic → Netlist" : load a raster schematic (JPG/PNG/BMP),
-///                                 adjust it for OCR, edit the netlist
-///                                 textually, save/load netlist files.
-///
-/// The two tabs share no state — each owns its own model and preview.
+/// Main window for Boardview Builder.
+/// Tab 1 "Schematic → Netlist" : load a raster schematic (JPG/PNG/BMP/PDF),
+///                               adjust it for OCR, edit the netlist
+///                               textually, save/load netlist files.
+/// Tab 2 "Future" : placeholder for future functionality.
 /// </summary>
 public sealed class MainForm : Form
 {
-    // ---- CSV tab state ----
-    private readonly TextBox _folderBox;
-    private readonly NumericUpDown _widthBox;
-    private readonly NumericUpDown _heightBox;
-    private readonly TextBox _brdPreview;
-    private readonly Label _csvStatus;
-    private readonly Button _saveBtn;
-    private BoardModel? _board;
-    private string _brdText = "";
-
     // ---- Schematic tab state ----
     private readonly TextBox _imagePathBox;
     private readonly PictureBox _imageBox;
@@ -67,11 +55,48 @@ public sealed class MainForm : Form
     private SchematicImageLoader.Phase2ExtractionResult? _phase2Result;
     private List<Rectangle> _manualSymbolBoxes = new();
     private List<WireTracer.DetectedPin> _manualPins = new();
+    private List<WireTracer.DetectedPin> _remainingDetectedPins = new();
 
     // Pan/zoom state
     private bool _panning;
     private Point _panStartCursor;
     private Point _panStartScroll;
+
+    // Dark theme colors
+    private static readonly Color DarkBackground = Color.FromArgb(30, 30, 30);
+    private static readonly Color DarkPanel = Color.FromArgb(45, 45, 45);
+    private static readonly Color DarkControl = Color.FromArgb(60, 60, 60);
+    private static readonly Color DarkBorder = Color.FromArgb(70, 70, 70);
+    private static readonly Color DarkText = Color.FromArgb(220, 220, 220);
+    private static readonly Color DarkTextDim = Color.FromArgb(160, 160, 160);
+
+    // Windows API for dark title bar and scrollbars
+    [DllImport("dwmapi.dll", PreserveSig = true)]
+    private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+    private const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
+
+    [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
+    private static extern int SetWindowTheme(IntPtr hwnd, string pszSubAppName, string? pszSubIdList);
+
+    private static void EnableDarkTitleBar(Form form)
+    {
+        try
+        {
+            int value = 1;
+            DwmSetWindowAttribute(form.Handle, DWMWA_USE_IMMERSIVE_DARK_MODE, ref value, sizeof(int));
+        }
+        catch { /* Ignore on older Windows versions */ }
+    }
+
+    /// <summary>Apply dark scrollbars to a control using Windows dark theme.</summary>
+    private static void EnableDarkScrollbars(Control control)
+    {
+        try
+        {
+            SetWindowTheme(control.Handle, "DarkMode_Explorer", null);
+        }
+        catch { /* Ignore on older Windows versions */ }
+    }
 
     public MainForm()
     {
@@ -81,16 +106,14 @@ public sealed class MainForm : Form
         StartPosition = FormStartPosition.CenterScreen;
         Font = new Font("Segoe UI", 9f);
 
-        var tabs = new TabControl { Dock = DockStyle.Fill };
+        // Use owner-drawn TabControl for dark theme
+        var tabs = new DarkTabControl { Dock = DockStyle.Fill };
         Controls.Add(tabs);
 
-        var csvTab = new TabPage("CSV → BRD") { Padding = new Padding(8) };
         var schemTab = new TabPage("Schematic → Netlist") { Padding = new Padding(8) };
-        tabs.TabPages.Add(csvTab);
+        var futureTab = new TabPage("Future") { Padding = new Padding(8) };
         tabs.TabPages.Add(schemTab);
-
-        // ===== CSV tab =====
-        (_folderBox, _widthBox, _heightBox, _brdPreview, _csvStatus, _saveBtn) = BuildCsvTab(csvTab);
+        tabs.TabPages.Add(futureTab);
 
         // ===== Schematic tab =====
         (_imagePathBox, _imageBox, _imageScroll, _zoomBar, _zoomLabel,
@@ -101,145 +124,143 @@ public sealed class MainForm : Form
          _adjRotateBtn, _adjResetBtn,
          _adjBrightnessVal, _adjContrastVal, _adjThresholdVal,
          _hideOcrBoxes, _showPins, _showWires) = BuildSchematicTab(schemTab);
+
+        // ===== Future tab (placeholder) =====
+        BuildFutureTab(futureTab);
+
+        // Apply dark theme to entire form
+        ApplyDarkTheme(this);
+
+        // Enable dark title bar (must be done after handle is created)
+        HandleCreated += (_, _) => EnableDarkTitleBar(this);
     }
 
-    // ---------------------------------------------------------------------
-    //  CSV → BRD tab  (unchanged from before)
-    // ---------------------------------------------------------------------
-    private (TextBox folder, NumericUpDown w, NumericUpDown h, TextBox preview,
-             Label status, Button save) BuildCsvTab(TabPage tab)
+    /// <summary>Recursively apply dark theme to all controls.</summary>
+    private static void ApplyDarkTheme(Control control)
     {
-        var root = new TableLayoutPanel
+        // Set form-level colors
+        if (control is Form form)
         {
-            Dock = DockStyle.Fill,
-            ColumnCount = 1,
-            RowCount = 3,
-        };
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        tab.Controls.Add(root);
-
-        var top = new TableLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            ColumnCount = 5,
-            RowCount = 2,
-            AutoSize = true,
-        };
-        top.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        top.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        top.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        top.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        top.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-
-        top.Controls.Add(new Label { Text = "CSV folder:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 8, 3, 3) }, 0, 0);
-        var folderBox = new TextBox { Dock = DockStyle.Fill };
-        top.Controls.Add(folderBox, 1, 0);
-        var browseBtn = new Button { Text = "Browse…", AutoSize = true };
-        browseBtn.Click += (_, _) => BrowseCsvFolder(folderBox);
-        top.Controls.Add(browseBtn, 2, 0);
-
-        var sizePanel = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, Margin = new Padding(0) };
-        sizePanel.Controls.Add(new Label { Text = "Board W×H (used only if no outline.csv):", AutoSize = true, Margin = new Padding(3, 8, 3, 3) });
-        var wBox = new NumericUpDown { Minimum = 1, Maximum = 10_000_000, Value = 2000, Width = 90 };
-        var hBox = new NumericUpDown { Minimum = 1, Maximum = 10_000_000, Value = 1500, Width = 90 };
-        sizePanel.Controls.Add(wBox);
-        sizePanel.Controls.Add(new Label { Text = "×", AutoSize = true, Margin = new Padding(3, 8, 3, 3) });
-        sizePanel.Controls.Add(hBox);
-        top.Controls.Add(sizePanel, 1, 1);
-
-        var loadBtn = new Button { Text = "Load && Preview", AutoSize = true };
-        top.Controls.Add(loadBtn, 3, 1);
-
-        var saveBtn = new Button { Text = "Save .brd…", AutoSize = true, Enabled = false };
-        top.Controls.Add(saveBtn, 4, 1);
-
-        root.Controls.Add(top, 0, 0);
-
-        var preview = new TextBox
-        {
-            Dock = DockStyle.Fill,
-            Multiline = true,
-            ScrollBars = ScrollBars.Both,
-            WordWrap = false,
-            ReadOnly = true,
-            Font = new Font("Consolas", 9.5f),
-        };
-        root.Controls.Add(preview, 0, 1);
-
-        var status = new Label
-        {
-            Dock = DockStyle.Fill,
-            AutoSize = false,
-            Height = 24,
-            TextAlign = ContentAlignment.MiddleLeft,
-            Text = "Pick a folder containing nets.csv, parts.csv, pins.csv (see samples/).",
-        };
-        root.Controls.Add(status, 0, 2);
-
-        loadBtn.Click += (_, _) => LoadCsvAndPreview(folderBox, wBox, hBox, preview, status, saveBtn);
-        saveBtn.Click += (_, _) => SaveBrd(folderBox, status);
-
-        return (folderBox, wBox, hBox, preview, status, saveBtn);
-    }
-
-    private static void BrowseCsvFolder(TextBox folderBox)
-    {
-        using var dlg = new FolderBrowserDialog { Description = "Select folder with nets.csv / parts.csv / pins.csv" };
-        if (Directory.Exists(folderBox.Text)) dlg.SelectedPath = folderBox.Text;
-        if (dlg.ShowDialog() == DialogResult.OK)
-            folderBox.Text = dlg.SelectedPath;
-    }
-
-    private void LoadCsvAndPreview(TextBox folderBox, NumericUpDown wBox, NumericUpDown hBox,
-                                   TextBox preview, Label status, Button saveBtn)
-    {
-        try
-        {
-            string folder = folderBox.Text.Trim();
-            if (!Directory.Exists(folder))
-            {
-                CsvWarn(status, "Folder does not exist.");
-                return;
-            }
-
-            _board = CsvLoader.Load(folder, (int)wBox.Value, (int)hBox.Value);
-            _brdText = BrdGenerator.Generate(_board);
-            preview.Text = _brdText.Replace("\n", Environment.NewLine);
-
-            int pinCount = _board.Parts.Sum(p => p.Pins.Count);
-            saveBtn.Enabled = true;
-            CsvOk(status,
-                $"Loaded: {_board.Parts.Count} parts, {pinCount} pins, " +
-                $"{_board.Nets.Count} nets, {_board.Nails.Count} nails, " +
-                $"{_board.Outline.Count} outline points. Review, then Save .brd.");
+            form.BackColor = DarkBackground;
+            form.ForeColor = DarkText;
         }
-        catch (Exception ex)
+
+        // Apply to each control based on type
+        foreach (Control c in control.Controls)
         {
-            _board = null;
-            saveBtn.Enabled = false;
-            preview.Text = "";
-            CsvWarn(status, ex.Message);
+            ApplyDarkThemeToControl(c);
+            // Recurse into child controls
+            if (c.HasChildren)
+                ApplyDarkTheme(c);
         }
     }
 
-    private void SaveBrd(TextBox folderBox, Label status)
+    private static void ApplyDarkThemeToControl(Control c)
     {
-        if (_board is null) return;
-        using var dlg = new SaveFileDialog
+        switch (c)
         {
-            Filter = "Boardview (*.brd)|*.brd|All files (*.*)|*.*",
-            FileName = "board.brd",
-            InitialDirectory = Directory.Exists(folderBox.Text) ? folderBox.Text : null,
-        };
-        if (dlg.ShowDialog() != DialogResult.OK) return;
-        File.WriteAllText(dlg.FileName, _brdText, new UTF8Encoding(false));
-        CsvOk(status, $"Saved {dlg.FileName} — open it in FlexBV.");
+            case TabControl tab:
+                tab.BackColor = DarkBackground;
+                tab.ForeColor = DarkText;
+                // DrawMode for custom tab painting would require more work
+                break;
+
+            case TabPage page:
+                page.BackColor = DarkPanel;
+                page.ForeColor = DarkText;
+                break;
+
+            case TextBox txt:
+                txt.BackColor = DarkControl;
+                txt.ForeColor = DarkText;
+                txt.BorderStyle = BorderStyle.FixedSingle;
+                // Apply dark scrollbars when handle is created
+                if (txt.Multiline && txt.ScrollBars != ScrollBars.None)
+                    txt.HandleCreated += (s, _) => EnableDarkScrollbars((Control)s!);
+                break;
+
+            case Button btn:
+                btn.BackColor = DarkControl;
+                btn.ForeColor = DarkText;
+                btn.FlatStyle = FlatStyle.Flat;
+                btn.FlatAppearance.BorderColor = DarkBorder;
+                break;
+
+            case Label lbl:
+                lbl.BackColor = Color.Transparent;
+                lbl.ForeColor = DarkText;
+                break;
+
+            case CheckBox chk:
+                chk.BackColor = Color.Transparent;
+                chk.ForeColor = DarkText;
+                break;
+
+            case NumericUpDown num:
+                num.BackColor = DarkControl;
+                num.ForeColor = DarkText;
+                break;
+
+            case ComboBox combo:
+                combo.BackColor = DarkControl;
+                combo.ForeColor = DarkText;
+                combo.FlatStyle = FlatStyle.Flat;
+                break;
+
+            case TrackBar:
+                // TrackBar doesn't support BackColor well on Windows
+                break;
+
+            case GroupBox grp:
+                grp.BackColor = DarkPanel;
+                grp.ForeColor = DarkText;
+                break;
+
+            case TableLayoutPanel tlp:
+                tlp.BackColor = DarkPanel;
+                break;
+
+            case FlowLayoutPanel flp:
+                flp.BackColor = Color.Transparent;
+                break;
+
+            case FocusOnHoverPanel fohp:
+                // Apply dark scrollbars to scroll panels
+                fohp.HandleCreated += (s, _) => EnableDarkScrollbars((Control)s!);
+                break;
+
+            case Panel panel:
+                panel.BackColor = DarkPanel;
+                if (panel.AutoScroll)
+                    panel.HandleCreated += (s, _) => EnableDarkScrollbars((Control)s!);
+                break;
+
+            case SplitContainer split:
+                split.BackColor = DarkPanel;
+                split.Panel1.BackColor = DarkPanel;
+                split.Panel2.BackColor = DarkPanel;
+                break;
+
+            case PictureBox:
+                // Keep as-is for image display
+                break;
+        }
     }
 
-    private static void CsvOk(Label status, string msg)   { status.ForeColor = Color.DarkGreen; status.Text = msg; }
-    private static void CsvWarn(Label status, string msg) { status.ForeColor = Color.Firebrick;  status.Text = "Error: " + msg; }
+    // ---------------------------------------------------------------------
+    //  Future tab (placeholder)
+    // ---------------------------------------------------------------------
+    private static void BuildFutureTab(TabPage tab)
+    {
+        var label = new Label
+        {
+            Text = "This tab is reserved for future functionality.",
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleCenter,
+            ForeColor = Color.FromArgb(160, 160, 160),
+        };
+        tab.Controls.Add(label);
+    }
 
     // ---------------------------------------------------------------------
     //  Schematic → Netlist tab
@@ -268,11 +289,10 @@ public sealed class MainForm : Form
         // ---- Row 0: file picker + zoom -------------------------------------
         var top = new TableLayoutPanel
         {
-            Dock = DockStyle.Fill, ColumnCount = 7, RowCount = 1, AutoSize = true,
+            Dock = DockStyle.Fill, ColumnCount = 6, RowCount = 1, AutoSize = true,
         };
         top.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         top.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        top.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         top.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         top.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         top.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
@@ -284,18 +304,16 @@ public sealed class MainForm : Form
 
         var browseBtn = new Button { Text = "Browse…", AutoSize = true };
         top.Controls.Add(browseBtn, 2, 0);
-        var loadBtn = new Button { Text = "Load image", AutoSize = true };
-        top.Controls.Add(loadBtn, 3, 0);
 
-        top.Controls.Add(new Label { Text = "Zoom:", AutoSize = true, Margin = new Padding(12, 8, 3, 3) }, 4, 0);
+        top.Controls.Add(new Label { Text = "Zoom:", AutoSize = true, Margin = new Padding(12, 8, 3, 3) }, 3, 0);
         var zoom = new TrackBar
         {
             Minimum = 10, Maximum = 800, TickFrequency = 50, Value = 100,
             Width = 200, AutoSize = false, Height = 30,
         };
-        top.Controls.Add(zoom, 5, 0);
+        top.Controls.Add(zoom, 4, 0);
         var zoomLabel = new Label { Text = "100%", AutoSize = true, Margin = new Padding(3, 8, 3, 3), MinimumSize = new Size(45, 0) };
-        top.Controls.Add(zoomLabel, 6, 0);
+        top.Controls.Add(zoomLabel, 5, 0);
 
         root.Controls.Add(top, 0, 0);
 
@@ -447,8 +465,7 @@ public sealed class MainForm : Form
         root.Controls.Add(bottom, 0, 3);
 
         // ---- Wire up events ------------------------------------------------
-        browseBtn.Click += (_, _) => BrowseSchematic(pathBox);
-        loadBtn.Click   += (_, _) => LoadSchematic(pathBox, img, zoom, zoomLabel, netlistText, status, extractBtn, step1Btn, step2Btn, step3Btn);
+        browseBtn.Click += (_, _) => BrowseAndLoadSchematic(pathBox, img, zoom, zoomLabel, netlistText, status, extractBtn, step1Btn, step2Btn, step3Btn);
 
         zoom.ValueChanged += (_, _) =>
         {
@@ -523,7 +540,9 @@ public sealed class MainForm : Form
 
     // ---- Image loading -------------------------------------------------------
 
-    private static void BrowseSchematic(TextBox pathBox)
+    private void BrowseAndLoadSchematic(TextBox pathBox, PictureBox img, TrackBar zoom, Label zoomLabel,
+                               TextBox netlistText, Label status,
+                               Button extractBtn, Button step1Btn, Button step2Btn, Button step3Btn)
     {
         using var dlg = new OpenFileDialog
         {
@@ -537,7 +556,10 @@ public sealed class MainForm : Form
         if (File.Exists(pathBox.Text))
             dlg.InitialDirectory = Path.GetDirectoryName(pathBox.Text);
         if (dlg.ShowDialog() == DialogResult.OK)
+        {
             pathBox.Text = dlg.FileName;
+            LoadSchematic(pathBox, img, zoom, zoomLabel, netlistText, status, extractBtn, step1Btn, step2Btn, step3Btn);
+        }
     }
 
     private void LoadSchematic(TextBox pathBox, PictureBox img, TrackBar zoom, Label zoomLabel,
@@ -682,10 +704,17 @@ public sealed class MainForm : Form
         // Bboxes are in the processed-image coordinate system at extraction time;
         // they stay valid as long as the user doesn't rotate after extracting.
         if (_lastOcr != null)
+        {
+            // Use remaining detected pins + manual pins for display after pin editing
+            var displayPins = (_remainingDetectedPins.Count > 0 || _manualPins.Count > 0)
+                ? _remainingDetectedPins.Concat(_manualPins).ToList()
+                : null;
             DrawOcrOverlay(newBmp, _lastOcr,
                 hideOcrText: _hideOcrBoxes.Checked,
                 showPins: _showPins.Checked,
-                showWires: _showWires.Checked);
+                showWires: _showWires.Checked,
+                overridePins: displayPins);
+        }
 
         var oldImage = img.Image;
         img.Image = newBmp;
@@ -694,6 +723,15 @@ public sealed class MainForm : Form
             _displayBitmap.Dispose();
         _displayBitmap = newBmp;
         ResizePictureBoxToZoom(img, zoom);
+    }
+
+    /// <summary>Calculate a scale factor for line thickness based on image size.
+    /// For a 1000px diagonal image, returns 1.0. Larger images get proportionally thicker lines.</summary>
+    private static float GetLineScaleFactor(int width, int height)
+    {
+        double diagonal = Math.Sqrt(width * width + height * height);
+        // Base on 1000px diagonal = 1.0 scale, with minimum of 1.0 and maximum of 5.0
+        return Math.Clamp((float)(diagonal / 1000.0), 1.0f, 5.0f);
     }
 
     /// <summary>Draw classified OCR bounding boxes onto <paramref name="bmp"/>.
@@ -712,7 +750,8 @@ public sealed class MainForm : Form
     /// is labelled with the designator it belongs to.
     /// When <paramref name="hideOcrText"/> is true, only YOLO boxes are drawn.</summary>
     private static void DrawOcrOverlay(Bitmap bmp, SchematicImageLoader.ExtractionResult ocr,
-        bool hideOcrText = false, bool showPins = true, bool showWires = true)
+        bool hideOcrText = false, bool showPins = true, bool showWires = true,
+        IReadOnlyList<WireTracer.DetectedPin>? overridePins = null)
     {
         var designators = new HashSet<string>(ocr.Designators.Keys, StringComparer.Ordinal);
         var netLabels   = new HashSet<string>(ocr.NetLabels.Keys,   StringComparer.Ordinal);
@@ -721,21 +760,30 @@ public sealed class MainForm : Form
         g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
         g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
 
-        using var penRef     = new Pen(Color.Red,    2f);
-        using var penNet     = new Pen(Color.LimeGreen, 2f);
-        using var penOther   = new Pen(Color.FromArgb(180, 200, 160, 0), 1f); // dim yellow
-        using var penSymbol  = new Pen(Color.DodgerBlue, 3f);                  // bold blue
-        using var penYolo    = new Pen(Color.Magenta, 2f);                     // YOLO detections
-        using var penPin     = new Pen(Color.OrangeRed, 2f);                   // pin circles
+        // Scale line thickness and sizes based on image dimensions
+        float scale = GetLineScaleFactor(bmp.Width, bmp.Height);
+        float thinLine = 1f * scale;
+        float normalLine = 2f * scale;
+        float thickLine = 3f * scale;
+        int pinRadius = Math.Max(3, (int)(3 * scale));   // Reduced pin size
+        float baseFontSize = 9f * Math.Min(scale, 2.5f);  // Don't scale fonts too much
+        float smallFontSize = 7f * Math.Min(scale, 2.5f);
+
+        using var penRef     = new Pen(Color.Red, normalLine);
+        using var penNet     = new Pen(Color.LimeGreen, normalLine);
+        using var penOther   = new Pen(Color.FromArgb(180, 200, 160, 0), thinLine); // dim yellow
+        using var penSymbol  = new Pen(Color.DodgerBlue, thickLine);                 // bold blue
+        using var penYolo    = new Pen(Color.Magenta, thinLine);                     // YOLO detections (thin like OCR)
+        using var penPin     = new Pen(Color.OrangeRed, thinLine);                   // pin circles
         using var brushRef   = new SolidBrush(Color.Red);
         using var brushNet   = new SolidBrush(Color.LimeGreen);
         using var brushOther = new SolidBrush(Color.FromArgb(200, 200, 160, 0));
         using var brushSym   = new SolidBrush(Color.DodgerBlue);
         using var brushYolo  = new SolidBrush(Color.Magenta);
         using var brushPin   = new SolidBrush(Color.OrangeRed);
-        using var labelFont  = new Font(FontFamily.GenericSansSerif, 9f, FontStyle.Bold);
-        using var symFont    = new Font(FontFamily.GenericSansSerif, 10f, FontStyle.Bold);
-        using var pinFont    = new Font(FontFamily.GenericSansSerif, 7f, FontStyle.Regular);
+        using var labelFont  = new Font(FontFamily.GenericSansSerif, baseFontSize, FontStyle.Bold);
+        using var symFont    = new Font(FontFamily.GenericSansSerif, baseFontSize + 1, FontStyle.Bold);
+        using var pinFont    = new Font(FontFamily.GenericSansSerif, smallFontSize, FontStyle.Regular);
 
         // ---- Pass 0: YOLO raw detections (magenta, drawn FIRST so everything else overlays) ----
         // Filter to only show highest confidence box when multiple overlap significantly
@@ -779,7 +827,7 @@ public sealed class MainForm : Form
                 if (r.Width <= 0 || r.Height <= 0) continue;
                 g.DrawRectangle(pen, r);
 
-                int textY = r.Y - 14;
+                int textY = r.Y - (int)(14 * scale);
                 if (textY < 0) textY = r.Bottom + 1;
                 g.DrawString(w.Text, labelFont, brush, r.X, textY);
             }
@@ -788,8 +836,8 @@ public sealed class MainForm : Form
         // ---- Pass 3: Pins (orange circles at YOLO box edges where wires cross) ----
         if (showPins)
         {
-            const int pinRadius = 5;
-            foreach (var pin in ocr.Pins)
+            var pinsToDisplay = overridePins ?? ocr.Pins;
+            foreach (var pin in pinsToDisplay)
             {
                 int cx = pin.Location.X;
                 int cy = pin.Location.Y;
@@ -807,7 +855,7 @@ public sealed class MainForm : Form
         // ---- Pass 4: Traced wires (blue lines pin-to-pin, ratsnest style) ----
         if (showWires)
         {
-            using var penWire = new Pen(Color.DodgerBlue, 2f);
+            using var penWire = new Pen(Color.DodgerBlue, normalLine);
 
             // Draw straight lines between connected pins
             foreach (var wire in ocr.TracedWires)
@@ -1099,8 +1147,14 @@ public sealed class MainForm : Form
                 $"{_phase1Result.TracePhase1.YoloHits.Count} YOLO detections. " +
                 $"Opening symbol box editor...");
 
+            // Collect OCR boxes for the editor
+            var ocrBoxes = _phase1Result.AllWords.Select(w => w.Bounds).ToList();
+
+            // Create a clean image (without overlay) for the editor
+            using var cleanImage = _adjustments.Apply(_schematic.Image);
+
             // Open symbol box editor
-            using var editor = new SymbolBoxEditor(_displayBitmap, _phase1Result.TracePhase1.YoloHits);
+            using var editor = new SymbolBoxEditor(cleanImage, _phase1Result.TracePhase1.YoloHits, ocrBoxes);
             if (editor.ShowDialog(this) == DialogResult.OK)
             {
                 _manualSymbolBoxes = editor.ManualBoxes.ToList();
@@ -1115,7 +1169,7 @@ public sealed class MainForm : Form
             }
 
             // Update overlay with any manual boxes
-            UpdateOverlayFromPhase1();
+            UpdateOverlayFromPhase1WithManualBoxes();
             RefreshProcessedImage(_imageBox, _zoomBar);
         }
         catch (Exception ex)
@@ -1152,22 +1206,33 @@ public sealed class MainForm : Form
                 $"Step 2: {_phase2Result.TracePhase2.Pins.Count} pins detected. " +
                 $"Opening pin editor...");
 
+            // Collect OCR boxes for the editor
+            var ocrBoxes = _phase1Result.AllWords.Select(w => w.Bounds).ToList();
+
+            // Create a clean image (without overlay) for the editor
+            using var cleanImage = _adjustments.Apply(_schematic.Image);
+
             // Open pin editor
             using var editor = new PinEditor(
-                _displayBitmap,
+                cleanImage,
                 _phase1Result.TracePhase1.YoloHits,
                 _manualSymbolBoxes,
-                _phase2Result.TracePhase2.Pins);
+                _phase2Result.TracePhase2.Pins,
+                ocrBoxes);
             if (editor.ShowDialog(this) == DialogResult.OK)
             {
                 _manualPins = editor.ManualPins.ToList();
+                _remainingDetectedPins = editor.RemainingDetectedPins.ToList();
                 step3Btn.Enabled = true;
+                int totalPins = _remainingDetectedPins.Count + _manualPins.Count;
                 SchemOk(status,
-                    $"Step 2 complete: {_phase2Result.TracePhase2.Pins.Count} detected + " +
-                    $"{_manualPins.Count} manual pins. Click '3: Trace Wires'.");
+                    $"Step 2 complete: {_remainingDetectedPins.Count} detected + " +
+                    $"{_manualPins.Count} manual = {totalPins} total pins. Click '3: Trace Wires'.");
             }
             else
             {
+                // Keep original detected pins if cancelled
+                _remainingDetectedPins = _phase2Result.TracePhase2.Pins.ToList();
                 SchemOk(status, "Pin editing cancelled.");
             }
 
@@ -1197,8 +1262,12 @@ public sealed class MainForm : Form
         Cursor.Current = Cursors.WaitCursor;
         try
         {
-            // Run Phase 3
-            var result = SchematicImageLoader.ExtractPhase3(_phase2Result, _schematic.Netlist, _manualPins);
+            // Run Phase 3 with remaining detected pins and manual pins
+            var result = SchematicImageLoader.ExtractPhase3(
+                _phase2Result,
+                _schematic.Netlist,
+                _manualPins,
+                _remainingDetectedPins);
             _lastOcr = result;
 
             RefreshProcessedImage(_imageBox, _zoomBar);
@@ -1239,6 +1308,37 @@ public sealed class MainForm : Form
             NetLabels = _phase1Result.NetLabels,
             SymbolBoxes = _phase1Result.TracePhase1.SymbolBoxes,
             YoloHits = _phase1Result.TracePhase1.YoloHits,
+            Pins = Array.Empty<WireTracer.DetectedPin>(),
+            Wires = Array.Empty<WireTracer.WireSegment>(),
+            TracedWires = Array.Empty<WireTracer.TracedWire>(),
+            Junctions = Array.Empty<WireTracer.WireJunction>(),
+        };
+    }
+
+    /// <summary>Create an overlay ExtractionResult from Phase 1 including manual boxes.</summary>
+    private void UpdateOverlayFromPhase1WithManualBoxes()
+    {
+        if (_phase1Result is null) return;
+
+        // Combine YOLO hits with manual boxes for display
+        var combinedYoloHits = new List<SymbolDetector.SymbolHit>(_phase1Result.TracePhase1.YoloHits);
+        foreach (var box in _manualSymbolBoxes)
+        {
+            combinedYoloHits.Add(new SymbolDetector.SymbolHit { Kind = "Manual", Bounds = box, Score = 1.0f });
+        }
+
+        _lastOcr = new SchematicImageLoader.ExtractionResult
+        {
+            Stats = new SchematicImageLoader.ExtractionStats(
+                _phase1Result.AllWords.Count,
+                _phase1Result.Designators.Count,
+                _phase1Result.NetLabels.Count,
+                0, 0, _phase1Result.ElapsedMs),
+            AllWords = _phase1Result.AllWords,
+            Designators = _phase1Result.Designators,
+            NetLabels = _phase1Result.NetLabels,
+            SymbolBoxes = _phase1Result.TracePhase1.SymbolBoxes,
+            YoloHits = combinedYoloHits,
             Pins = Array.Empty<WireTracer.DetectedPin>(),
             Wires = Array.Empty<WireTracer.WireSegment>(),
             TracedWires = Array.Empty<WireTracer.TracedWire>(),
@@ -1331,8 +1431,8 @@ public sealed class MainForm : Form
         SchemOk(status, "Label editor closed.");
     }
 
-    private static void SchemOk(Label status, string msg)   { status.ForeColor = Color.DarkGreen; status.Text = msg; }
-    private static void SchemWarn(Label status, string msg) { status.ForeColor = Color.Firebrick;  status.Text = "Error: " + msg; }
+    private static void SchemOk(Label status, string msg)   { status.ForeColor = Color.LimeGreen; status.Text = msg; }
+    private static void SchemWarn(Label status, string msg) { status.ForeColor = Color.Tomato;     status.Text = "Error: " + msg; }
 
 
     protected override void Dispose(bool disposing)
@@ -1363,5 +1463,70 @@ internal sealed class FocusOnHoverPanel : Panel
     {
         base.OnMouseEnter(e);
         if (!Focused) Focus();
+    }
+}
+
+/// <summary>
+/// Owner-drawn TabControl with dark theme support.
+/// </summary>
+internal sealed class DarkTabControl : TabControl
+{
+    private static readonly Color DarkBackground = Color.FromArgb(30, 30, 30);
+    private static readonly Color DarkPanel = Color.FromArgb(45, 45, 45);
+    private static readonly Color DarkTabSelected = Color.FromArgb(60, 60, 60);
+    private static readonly Color DarkText = Color.FromArgb(220, 220, 220);
+    private static readonly Color DarkTextDim = Color.FromArgb(140, 140, 140);
+
+    public DarkTabControl()
+    {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.DoubleBuffer, true);
+        DrawMode = TabDrawMode.OwnerDrawFixed;
+        Padding = new Point(12, 4);
+        ItemSize = new Size(120, 28);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.Clear(DarkBackground);
+
+        // Draw tab strip background
+        var tabStripRect = new Rectangle(0, 0, Width, ItemSize.Height + 4);
+        using var tabStripBrush = new SolidBrush(DarkPanel);
+        g.FillRectangle(tabStripBrush, tabStripRect);
+
+        // Draw each tab
+        for (int i = 0; i < TabCount; i++)
+        {
+            var tabRect = GetTabRect(i);
+            bool isSelected = (SelectedIndex == i);
+
+            // Tab background
+            using var tabBrush = new SolidBrush(isSelected ? DarkTabSelected : DarkPanel);
+            g.FillRectangle(tabBrush, tabRect);
+
+            // Tab text
+            var textColor = isSelected ? DarkText : DarkTextDim;
+            using var textBrush = new SolidBrush(textColor);
+            using var font = new Font(Font.FontFamily, Font.Size, isSelected ? FontStyle.Bold : FontStyle.Regular);
+            var textFormat = new StringFormat
+            {
+                Alignment = StringAlignment.Center,
+                LineAlignment = StringAlignment.Center
+            };
+            g.DrawString(TabPages[i].Text, font, textBrush, tabRect, textFormat);
+
+            // Bottom border for selected tab (accent)
+            if (isSelected)
+            {
+                using var accentPen = new Pen(Color.FromArgb(80, 160, 220), 2);
+                g.DrawLine(accentPen, tabRect.Left + 2, tabRect.Bottom - 1, tabRect.Right - 2, tabRect.Bottom - 1);
+            }
+        }
+    }
+
+    protected override void OnDrawItem(DrawItemEventArgs e)
+    {
+        // Handled in OnPaint
     }
 }
