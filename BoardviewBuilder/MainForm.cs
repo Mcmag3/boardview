@@ -852,20 +852,116 @@ public sealed class MainForm : Form
             }
         }
 
-        // ---- Pass 4: Traced wires (blue lines pin-to-pin, ratsnest style) ----
+        // ---- Pass 4: Traced wires (ratsnest style with MST - like KiCad PCB editor) ----
         if (showWires)
         {
             using var penWire = new Pen(Color.DodgerBlue, normalLine);
 
-            // Draw straight lines between connected pins
+            // Use Union-Find to group pins that are connected via wires
+            var allPoints = new List<Point>();
+            var pointIndex = new Dictionary<Point, int>();
+
+            // Collect all unique points
             foreach (var wire in ocr.TracedWires)
             {
-                if (wire.Path.Count >= 2)
+                if (wire.Path.Count < 2) continue;
+                var p1 = wire.Path[0];
+                var p2 = wire.Path[wire.Path.Count - 1];
+
+                if (!pointIndex.ContainsKey(p1))
                 {
-                    g.DrawLine(penWire, wire.Path[0], wire.Path[wire.Path.Count - 1]);
+                    pointIndex[p1] = allPoints.Count;
+                    allPoints.Add(p1);
+                }
+                if (!pointIndex.ContainsKey(p2))
+                {
+                    pointIndex[p2] = allPoints.Count;
+                    allPoints.Add(p2);
+                }
+            }
+
+            if (allPoints.Count < 2) return;
+
+            // Union-Find: parent array
+            var parent = Enumerable.Range(0, allPoints.Count).ToArray();
+            int Find(int x) => parent[x] == x ? x : parent[x] = Find(parent[x]);
+            void Union(int a, int b) => parent[Find(a)] = Find(b);
+
+            // Union all connected pins
+            foreach (var wire in ocr.TracedWires)
+            {
+                if (wire.Path.Count < 2) continue;
+                var p1 = wire.Path[0];
+                var p2 = wire.Path[wire.Path.Count - 1];
+                Union(pointIndex[p1], pointIndex[p2]);
+            }
+
+            // Group points by their root
+            var nets = new Dictionary<int, List<Point>>();
+            for (int i = 0; i < allPoints.Count; i++)
+            {
+                int root = Find(i);
+                if (!nets.ContainsKey(root))
+                    nets[root] = new List<Point>();
+                nets[root].Add(allPoints[i]);
+            }
+
+            // For each net, compute and draw Minimum Spanning Tree
+            foreach (var net in nets.Values)
+            {
+                if (net.Count < 2) continue;
+
+                var mstEdges = ComputeMinimumSpanningTree(net);
+                foreach (var (p1, p2) in mstEdges)
+                {
+                    g.DrawLine(penWire, p1, p2);
                 }
             }
         }
+    }
+
+    /// <summary>Compute Minimum Spanning Tree using Prim's algorithm.</summary>
+    private static List<(Point, Point)> ComputeMinimumSpanningTree(List<Point> points)
+    {
+        if (points.Count < 2) return new List<(Point, Point)>();
+
+        var edges = new List<(Point, Point)>();
+        var inTree = new HashSet<int> { 0 }; // Start with first point
+
+        while (inTree.Count < points.Count)
+        {
+            int bestFrom = -1, bestTo = -1;
+            double bestDist = double.MaxValue;
+
+            // Find shortest edge from tree to non-tree point
+            foreach (int from in inTree)
+            {
+                for (int to = 0; to < points.Count; to++)
+                {
+                    if (inTree.Contains(to)) continue;
+
+                    double dist = Math.Sqrt(
+                        Math.Pow(points[from].X - points[to].X, 2) +
+                        Math.Pow(points[from].Y - points[to].Y, 2));
+
+                    if (dist < bestDist)
+                    {
+                        bestDist = dist;
+                        bestFrom = from;
+                        bestTo = to;
+                    }
+                }
+            }
+
+            if (bestTo >= 0)
+            {
+                inTree.Add(bestTo);
+                edges.Add((points[bestFrom], points[bestTo]));
+            }
+            else break;
+        }
+
+        return edges;
     }
 
     /// <summary>Filter YOLO hits to only keep highest confidence when boxes overlap significantly (IoU > 0.3).</summary>
@@ -1272,7 +1368,8 @@ public sealed class MainForm : Form
 
             RefreshProcessedImage(_imageBox, _zoomBar);
 
-            netlistText.Text = NetlistTextFormat.Format(_schematic.Netlist)
+            // Build netlist from traced wires
+            netlistText.Text = BuildNetlistFromTracedWires(result.TracedWires)
                                                 .Replace("\n", Environment.NewLine);
 
             var s = result.Stats;
@@ -1288,6 +1385,76 @@ public sealed class MainForm : Form
         {
             Cursor.Current = Cursors.Default;
         }
+    }
+
+    /// <summary>Build a netlist text from traced wires using Union-Find to group connected pins.</summary>
+    private static string BuildNetlistFromTracedWires(IReadOnlyList<WireTracer.TracedWire> tracedWires)
+    {
+        // Collect all unique pins
+        var allPins = new List<string>();
+        var pinIndex = new Dictionary<string, int>();
+
+        foreach (var wire in tracedWires)
+        {
+            if (wire.StartPin != null && !pinIndex.ContainsKey(wire.StartPin))
+            {
+                pinIndex[wire.StartPin] = allPins.Count;
+                allPins.Add(wire.StartPin);
+            }
+            if (wire.EndPin != null && !pinIndex.ContainsKey(wire.EndPin))
+            {
+                pinIndex[wire.EndPin] = allPins.Count;
+                allPins.Add(wire.EndPin);
+            }
+        }
+
+        if (allPins.Count == 0)
+            return "# No nets found\n";
+
+        // Union-Find
+        var parent = Enumerable.Range(0, allPins.Count).ToArray();
+        int Find(int x) => parent[x] == x ? x : parent[x] = Find(parent[x]);
+        void Union(int a, int b) => parent[Find(a)] = Find(b);
+
+        // Union connected pins
+        foreach (var wire in tracedWires)
+        {
+            if (wire.StartPin != null && wire.EndPin != null)
+            {
+                Union(pinIndex[wire.StartPin], pinIndex[wire.EndPin]);
+            }
+        }
+
+        // Group pins by net
+        var nets = new Dictionary<int, List<string>>();
+        for (int i = 0; i < allPins.Count; i++)
+        {
+            int root = Find(i);
+            if (!nets.ContainsKey(root))
+                nets[root] = new List<string>();
+            nets[root].Add(allPins[i]);
+        }
+
+        // Build output
+        var sb = new StringBuilder();
+        sb.AppendLine("# Traced Nets");
+        sb.AppendLine();
+
+        int netNum = 1;
+        foreach (var net in nets.Values.OrderByDescending(n => n.Count))
+        {
+            if (net.Count < 2) continue; // Skip single-pin "nets"
+
+            sb.AppendLine($"NET N${netNum}");
+            foreach (var pin in net.OrderBy(p => p))
+            {
+                sb.AppendLine($"  {pin}");
+            }
+            sb.AppendLine();
+            netNum++;
+        }
+
+        return sb.ToString();
     }
 
     /// <summary>Create an overlay ExtractionResult from Phase 1 for display.</summary>
